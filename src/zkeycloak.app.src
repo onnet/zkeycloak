@@ -1,0 +1,9 @@
+{application,zkeycloak,
+             [{applications,[kazoo,kazoo_amqp,kazoo_apps,
+                             kazoo_stdlib,kernel,lager,stdlib,oidcc]},
+              {description,"Connection to Keycloak"},
+              {env,[{is_kazoo_app,true}]},
+              {mod,{zkeycloak_app,[]}},
+              {modules,[]},
+              {registered,[zkeycloak_cache,zkeycloak_sup]},
+              {vsn,"4.0.0"}]}.
