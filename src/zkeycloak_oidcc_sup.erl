@@ -15,8 +15,8 @@
                      'start' =>
                          {'oidcc_provider_configuration_worker', 'start_link', [
                              #{
-                                 'issuer' => "https://keycloack.brterminal.ru:8080/realms/onbillrealm",
-                                 'name' => {'local', 'onbill_client'}
+                                 'issuer' =>  zkeycloak_util:issuer(),
+                                 'name' => {'local', zkeycloak_util:client_id_atom()}
                              }
                          ]},
                      'shutdown' => 'brutal_kill'
