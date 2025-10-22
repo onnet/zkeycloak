@@ -55,27 +55,27 @@ preferred_auth_methods() ->
 auth_url() ->
     {ok, RedirectUri} =
         oidcc:create_redirect_url(
-            client_id_atom()
-            ,client_id()
-            ,client_secret()
-            ,#{'redirect_uri' => redirect_uri()
-              ,'preferred_auth_methods' => preferred_auth_methods() 
-              }
-        ),
+          client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{'redirect_uri' => redirect_uri()
+           ,'preferred_auth_methods' => preferred_auth_methods() 
+           }
+         ),
     kz_binary:join(RedirectUri, <<"">>).
 
 -spec retrieve_token(kz_term:ne_binary()) -> kz_term:ne_binary().
 retrieve_token(AuthCode) ->
     {ok, Token} =
         oidcc:retrieve_token(
-            AuthCode
-            ,client_id_atom()
-            ,client_id()
-            ,client_secret()
-            ,#{'redirect_uri' => redirect_uri()
-              ,'preferred_auth_methods' => preferred_auth_methods()
-              }
-        ),
+          AuthCode
+         ,client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{'redirect_uri' => redirect_uri()
+           ,'preferred_auth_methods' => preferred_auth_methods()
+           }
+         ),
     Token.
 
 -spec create_user(kz_term:ne_binary()

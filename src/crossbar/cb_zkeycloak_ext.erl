@@ -131,10 +131,10 @@ validate(Context, ?AUTH_CALLBACK) ->
     Code = kz_json:get_ne_binary_value(<<"code">>, QS),
     case zkeycloak_util:retrieve_token(Code) of
         {oidcc_token
-            ,{oidcc_token_id, TokenId, ClaimsMap}
-            ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
-            ,{oidcc_token_refresh, TokenRefresh}
-            ,_Scope
+        ,{oidcc_token_id, TokenId, ClaimsMap}
+        ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
+        ,{oidcc_token_refresh, TokenRefresh}
+        ,_Scope
         } ->
             lager:info("validate_ext/2  TokenId: ~p",[TokenId]),
             lager:info("validate_ext/2  TokenAccess: ~p",[TokenAccess]),
@@ -163,17 +163,17 @@ validate(Context, ?AUTH_CALLBACK) ->
                       ,{<<"owner_id">>, OwnerId}
                       ]),
             Resp = crossbar_util:response_auth(kz_json:from_list(Props), AccountId, OwnerId),
-%
-%
-%            lager:debug("created new local auth token: ~s", [kz_json:encode(Resp)]),
-%
-%            log_success_auth(Method, <<"jwt_auth_token">>, <<"authentication resulted in token creation">>, Context, AccountId, AuthConfig),
-%
-%            lager:info("create_auth_token JObj: ~p", [JObj]),
-%            lager:info("create_auth_token RespObj: ~p", [RespObj]),
-%            lager:info("create_auth_token Claims: ~p", [Claims]),
-%            lager:info("create_auth_token AuthConfig: ~p", [AuthConfig]),
-%            lager:info("create_auth_token Method: ~p", [Method]),
+                                                %
+                                                %
+                                                %            lager:debug("created new local auth token: ~s", [kz_json:encode(Resp)]),
+                                                %
+                                                %            log_success_auth(Method, <<"jwt_auth_token">>, <<"authentication resulted in token creation">>, Context, AccountId, AuthConfig),
+                                                %
+                                                %            lager:info("create_auth_token JObj: ~p", [JObj]),
+                                                %            lager:info("create_auth_token RespObj: ~p", [RespObj]),
+                                                %            lager:info("create_auth_token Claims: ~p", [Claims]),
+                                                %            lager:info("create_auth_token AuthConfig: ~p", [AuthConfig]),
+                                                %            lager:info("create_auth_token Method: ~p", [Method]),
             crossbar_util:response(Resp, cb_context:setters(Context, Setters));
         _ ->
             cb_context:add_system_error('invalid_credentials', Context)

@@ -14,13 +14,13 @@
 -define(CHILDREN, [#{'id' => 'oidcc_provider_configuration_worker',
                      'start' =>
                          {'oidcc_provider_configuration_worker', 'start_link', [
-                             #{
-                                 'issuer' =>  zkeycloak_util:issuer(),
-                                 'name' => {'local', zkeycloak_util:client_id_atom()}
-                             }
-                         ]},
+                                                                                #{
+                                                                                  'issuer' =>  zkeycloak_util:issuer(),
+                                                                                  'name' => {'local', zkeycloak_util:client_id_atom()}
+                                                                                 }
+                                                                               ]},
                      'shutdown' => 'brutal_kill'
-                   }]).
+                    }]).
 
 -spec start_link() -> kz_types:startlink_ret().
 start_link() ->
