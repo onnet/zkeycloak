@@ -8,6 +8,9 @@
         ,redirect_uri/0
         ,preferred_auth_methods/0
         ,retrieve_token/1
+        ,retrieve_userinfo/1
+        ,introspect_token/1
+        ,refresh_token/1
         ,create_user/7
         ]
        ).
@@ -64,7 +67,7 @@ auth_url() ->
          ),
     kz_binary:join(RedirectUri, <<"">>).
 
--spec retrieve_token(kz_term:ne_binary()) -> kz_term:ne_binary().
+-spec retrieve_token(kz_term:ne_binary()) -> any().
 retrieve_token(AuthCode) ->
     {ok, Token} =
         oidcc:retrieve_token(
@@ -77,6 +80,42 @@ retrieve_token(AuthCode) ->
            }
          ),
     Token.
+
+-spec retrieve_userinfo(kz_term:ne_binary()) -> any().
+retrieve_userinfo(Token) ->
+    {ok, Claims} =
+        oidcc:retrieve_userinfo(
+          Token
+         ,client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{}
+         ),
+    Claims.
+
+-spec introspect_token(kz_term:ne_binary()) -> any().
+introspect_token(Token) ->
+    {ok, Introspection} =
+        oidcc:introspect_token(
+          Token
+         ,client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{}
+         ),
+    Introspection.
+
+-spec refresh_token(kz_term:ne_binary()) -> any().
+refresh_token(Token) ->
+    {ok, RefreshedToken} =
+        oidcc:introspect_token(
+          Token
+         ,client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{}
+         ),
+    RefreshedToken.
 
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
