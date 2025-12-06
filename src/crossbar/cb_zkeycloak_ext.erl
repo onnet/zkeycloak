@@ -148,7 +148,7 @@ validate(Context, ?AUTH_CALLBACK) ->
             UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap),
             case lists:member(<<"onbill_access">>, UserInfoRoles) of
                 'true' ->
-                    provide_keycloak_token(Context, TokenTuple);
+                    provide_keycloak_token(Context, TokenAccess, UserInfoMap);
                 'false' ->
                     lager:info("validate_ext/2  insufficient UserInfoRoles: ~p",[UserInfoRoles]),
                     cb_context:add_system_error('insufficient_role', Context)
@@ -179,47 +179,31 @@ zkeycloak_ext_post(Context) ->
     lager:info("zkeycloak_ext_post/1 req_json: ~p",[ReqJSON]),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, kz_json:new()), 'success').
 
-provide_keycloak_token(Context, {oidcc_token ,{oidcc_token_id, _TokenId, ClaimsMap}
-                                ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
-                                ,{oidcc_token_refresh, _TokenRefresh}
-                                ,_Scope
-                                }
-                      ) ->
-
-    ClaimsProps = kz_json:to_proplist(kz_json:from_map(ClaimsMap)),
-    AccountId = props:get_value(<<"account_id">>, ClaimsProps),
-    OwnerId = zbrt_util:from_key(props:get_value(<<"sub">>, ClaimsProps)),
-    DbName = kzs_util:format_account_id(AccountId,'encoded'),
+provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
+    AccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
+    OwnerId = zbrt_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap)),
+    DbName = kzs_util:format_account_id(AccountId, 'encoded'),
 
     case kz_datamgr:open_doc(DbName, OwnerId) of
         {'ok', _} -> 'ok';
         _ ->
-            Firstname = props:get_value(<<"given_name">>, ClaimsProps),
-            Surname = props:get_value(<<"family_name">>, ClaimsProps),
-            Email = props:get_value(<<"email">>, ClaimsProps),
+            Firstname = kz_maps:get(<<"given_name">>, UserInfoMap),
+            Surname = kz_maps:get(<<"family_name">>, UserInfoMap),
+            Email = kz_maps:get(<<"email">>, UserInfoMap),
             Phonenumber = <<"">>,
             UserPassword = kz_binary:rand_hex(12),
             zkeycloak_util:create_user(AccountId, OwnerId, Firstname, Surname, Email, Phonenumber, UserPassword)
     end,
-    lager:info("validate_ext/2  ClaimsProps: ~p",[ClaimsProps]),
+    UserInfoJObj = kz_json:from_map(UserInfoMap),
+    lager:info("provide_keycloak_token/2  UserInfoJObj: ~p",[UserInfoJObj]),
     Setters = [{fun cb_context:set_auth_token/2, TokenAccess}
-              ,{fun cb_context:set_auth_doc/2, kz_json:from_list(ClaimsProps)}
+              ,{fun cb_context:set_auth_doc/2, UserInfoJObj}
               ],
     Props = props:filter_undefined(
               [{<<"account_id">>, AccountId}
               ,{<<"owner_id">>, OwnerId}
+              ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
               ]),
     Resp = crossbar_util:response_auth(kz_json:from_list(Props), AccountId, OwnerId),
-                                                %
-                                                %
-                                                %            lager:debug("created new local auth token: ~s", [kz_json:encode(Resp)]),
-                                                %
-                                                %            log_success_auth(Method, <<"jwt_auth_token">>, <<"authentication resulted in token creation">>, Context, AccountId, AuthConfig),
-                                                %
-                                                %            lager:info("create_auth_token JObj: ~p", [JObj]),
-                                                %            lager:info("create_auth_token RespObj: ~p", [RespObj]),
-                                                %            lager:info("create_auth_token Claims: ~p", [Claims]),
-                                                %            lager:info("create_auth_token AuthConfig: ~p", [AuthConfig]),
-                                                %            lager:info("create_auth_token Method: ~p", [Method]),
     crossbar_util:response(Resp, cb_context:setters(Context, Setters)).
 

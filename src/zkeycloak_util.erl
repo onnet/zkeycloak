@@ -12,6 +12,10 @@
         ,introspect_token/1
         ,refresh_token/1
         ,create_user/7
+        ,jwt_claims/1
+        ,jwt_iss/1
+        ,maybe_keycloak_token/1
+        ,maybe_keycloak_token_validate/2
         ]
        ).
 
@@ -155,5 +159,36 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
             lager:info("create_user Result: ~p", [Result]);
         Err ->
             lager:info("create_user Err: ~p", [Err])
+    end.
+
+-spec jwt_claims(kz_term:ne_binary()) -> kz_term:proplist().
+jwt_claims(Token) ->
+    {ok, _Heder, Claims} = kz_auth_jwt:decode(Token),
+    Claims.
+
+-spec jwt_iss(kz_term:ne_binary()) -> kz_term:proplist().
+jwt_iss(Token) ->
+    Claims = jwt_claims(Token),
+    props:get_ne_binary_value(<<"iss">>, Claims).
+
+-spec maybe_keycloak_token(kz_term:ne_binary()) -> boolean().
+maybe_keycloak_token(Token) ->
+    jwt_iss(Token) == issuer().
+
+-spec maybe_keycloak_token_validate(kz_term:ne_binary(), kz_term:proplist()) -> boolean().
+maybe_keycloak_token_validate(Token, _Options) ->
+    case maybe_keycloak_token(Token) of
+        'false' ->
+            {'ok', 'not_keycloack_token'};
+        'true' ->
+            Claims = jwt_claims(Token),
+            ResourceAccessMap = props:get_value(<<"resource_access">>, Claims),
+            ClientRoles = kz_maps:get([<<"onbill_client">>,<<"roles">>], ResourceAccessMap),
+            case lists:member(<<"onbill_access">>, ClientRoles) of
+                'true' ->
+                    {'ok', 'onbill_access_provided'};
+                'false' ->
+                    {'error', 'onbill_access_absent'}
+            end
     end.
 
