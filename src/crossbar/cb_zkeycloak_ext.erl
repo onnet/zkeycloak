@@ -19,6 +19,7 @@
 
 -define(AUTH_LINK, <<"auth_link">>).
 -define(AUTH_CALLBACK, <<"auth_callback">>).
+-define(KERBEROS_LOGIN, <<"kerberos_login">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
 -spec init() -> ok.
@@ -36,6 +37,7 @@ allowed_methods() -> [?HTTP_POST, ?HTTP_GET].
 -spec allowed_methods(path_token()) -> http_methods().
 allowed_methods(?AUTH_LINK) -> [?HTTP_GET];
 allowed_methods(?AUTH_CALLBACK) -> [?HTTP_GET];
+allowed_methods(?KERBEROS_LOGIN) -> [?HTTP_GET];
 allowed_methods(?ZKEYCLOAK) -> [?HTTP_POST, ?HTTP_GET].
 
 -spec resource_exists() -> boolean().
@@ -43,6 +45,7 @@ resource_exists() -> 'true'.
 -spec resource_exists(path_tokens()) -> boolean().
 resource_exists(?AUTH_LINK) -> 'true';
 resource_exists(?AUTH_CALLBACK) -> 'true';
+resource_exists(?KERBEROS_LOGIN) -> 'true';
 resource_exists(?ZKEYCLOAK) -> 'true'.
 
 -spec authorize(cb_context:context()) -> boolean() | {'stop', cb_context:context()}.
@@ -75,6 +78,9 @@ authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_link">>]}], Method) wh
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}], Method) when Method =:= ?HTTP_GET ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing zkeycloak_ext"),
     'true';
+authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}], Method) when Method =:= ?HTTP_GET ->
+    lager:info("authorize_nouns_zkeycloak_ext authorizing kerberos_login"),
+    'true';
 authorize_nouns(_, _Nouns, _) ->
     lager:info("authorize_nouns_zkeycloak_ext undefined _Nouns: ~p", [_Nouns]),
     'false'.
@@ -97,6 +103,8 @@ authenticate_nouns(Context, [{<<"zkeycloak_ext">>, []}]) ->
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_link">>]}]) ->
     'true';
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}]) ->
+    'true';
+authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}]) ->
     'true';
 authenticate_nouns(_Context, _Nouns) ->
     lager:info("authenticate_nouns/1 _Nouns: ~p",[_Nouns]),
@@ -156,6 +164,22 @@ validate(Context, ?AUTH_CALLBACK) ->
         _ ->
             cb_context:add_system_error('invalid_credentials', Context)
     end;
+validate(Context, ?KERBEROS_LOGIN) ->
+    lager:info("validate_ext/2 kerberos_login req_nouns: ~p",[cb_context:req_nouns(Context)]),
+    case zkeycloak_util:kerberos_enabled() of
+        'true' ->
+            QS = cb_context:query_string(Context),
+            Prompt = kz_json:get_ne_binary_value(<<"prompt">>, QS),
+            ExtraOpts = case Prompt of
+                <<"none">> -> #{'prompt' => <<"none">>};
+                _ -> #{}
+            end,
+            AuthUrl = zkeycloak_util:kerberos_auth_url(ExtraOpts),
+            JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),
+            cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+        'false' ->
+            cb_context:add_system_error('forbidden', Context)
+    end;
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
@@ -199,10 +223,12 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
     Setters = [{fun cb_context:set_auth_token/2, TokenAccess}
               ,{fun cb_context:set_auth_doc/2, UserInfoJObj}
               ],
+    AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
     Props = props:filter_undefined(
               [{<<"account_id">>, AccountId}
               ,{<<"owner_id">>, OwnerId}
               ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
+              ,{<<"auth_method">>, AuthMethod}
               ]),
     Resp = crossbar_util:response_auth(kz_json:from_list(Props), AccountId, OwnerId),
     crossbar_util:response(Resp, cb_context:setters(Context, Setters)).

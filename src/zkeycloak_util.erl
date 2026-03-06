@@ -16,6 +16,11 @@
         ,jwt_iss/1
         ,maybe_keycloak_token/1
         ,maybe_keycloak_token_validate/2
+        ,kerberos_enabled/0
+        ,kerberos_idp_hint/0
+        ,kerberos_auth_url/0
+        ,kerberos_auth_url/1
+        ,auth_method/1
         ]
        ).
 
@@ -67,6 +72,37 @@ auth_url() ->
          ,client_secret()
          ,#{'redirect_uri' => redirect_uri()
            ,'preferred_auth_methods' => preferred_auth_methods() 
+           }
+         ),
+    kz_binary:join(RedirectUri, <<"">>).
+
+-spec kerberos_enabled() -> boolean().
+kerberos_enabled() ->
+    kapps_config:get_is_true(<<"zkeycloak">>, <<"kerberos_enabled">>, 'false').
+
+-spec kerberos_idp_hint() -> kz_term:ne_binary().
+kerberos_idp_hint() ->
+    kapps_config:get_ne_binary(<<"zkeycloak">>, <<"kerberos_idp_hint">>, <<"kerberos">>).
+
+-spec kerberos_auth_url() -> kz_term:ne_binary().
+kerberos_auth_url() ->
+    kerberos_auth_url(#{}).
+
+-spec kerberos_auth_url(map()) -> kz_term:ne_binary().
+kerberos_auth_url(ExtraOpts) ->
+    BaseExtension = [{<<"kc_idp_hint">>, kerberos_idp_hint()}],
+    PromptExtension = case maps:get('prompt', ExtraOpts, 'undefined') of
+        'undefined' -> [];
+        Prompt -> [{<<"prompt">>, Prompt}]
+    end,
+    {ok, RedirectUri} =
+        oidcc:create_redirect_url(
+          client_id_atom()
+         ,client_id()
+         ,client_secret()
+         ,#{'redirect_uri' => redirect_uri()
+           ,'preferred_auth_methods' => preferred_auth_methods()
+           ,'url_extension' => BaseExtension ++ PromptExtension
            }
          ),
     kz_binary:join(RedirectUri, <<"">>).
@@ -190,5 +226,15 @@ maybe_keycloak_token_validate(Token, _Options) ->
                 'false' ->
                     {'error', 'onbill_access_absent'}
             end
+    end.
+
+-spec auth_method(kz_term:ne_binary()) -> 'oidc' | 'kerberos' | 'unknown'.
+auth_method(Token) ->
+    Claims = jwt_claims(Token),
+    Acr = props:get_ne_binary_value(<<"acr">>, Claims, <<>>),
+    case Acr of
+        <<"kerberos">> -> 'kerberos';
+        <<"1">> -> 'oidc';
+        _ -> 'unknown'
     end.
 
