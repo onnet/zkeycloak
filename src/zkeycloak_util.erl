@@ -65,16 +65,22 @@ preferred_auth_methods() ->
 
 -spec auth_url() -> kz_term:ne_binary().
 auth_url() ->
-    {ok, RedirectUri} =
+    lager:info("zkeycloak auth_url: issuer=~s client_id=~s redirect_uri=~s",
+               [issuer(), client_id(), redirect_uri()]),
+    Result =
         oidcc:create_redirect_url(
           client_id_atom()
          ,client_id()
          ,client_secret()
          ,#{'redirect_uri' => redirect_uri()
-           ,'preferred_auth_methods' => preferred_auth_methods() 
+           ,'preferred_auth_methods' => preferred_auth_methods()
            }
          ),
-    kz_binary:join(RedirectUri, <<"">>).
+    lager:info("zkeycloak auth_url oidcc result: ~p", [Result]),
+    {ok, RedirectUri} = Result,
+    Url = kz_binary:join(RedirectUri, <<"">>),
+    lager:info("zkeycloak auth_url final: ~s", [Url]),
+    Url.
 
 -spec kerberos_enabled() -> boolean().
 kerberos_enabled() ->
@@ -95,7 +101,9 @@ kerberos_auth_url(ExtraOpts) ->
         'undefined' -> [];
         Prompt -> [{<<"prompt">>, Prompt}]
     end,
-    {ok, RedirectUri} =
+    lager:info("zkeycloak kerberos_auth_url: issuer=~s client_id=~s redirect_uri=~s",
+               [issuer(), client_id(), redirect_uri()]),
+    Result =
         oidcc:create_redirect_url(
           client_id_atom()
          ,client_id()
@@ -105,7 +113,11 @@ kerberos_auth_url(ExtraOpts) ->
            ,'url_extension' => BaseExtension ++ PromptExtension
            }
          ),
-    kz_binary:join(RedirectUri, <<"">>).
+    lager:info("zkeycloak kerberos_auth_url oidcc result: ~p", [Result]),
+    {ok, RedirectUri} = Result,
+    Url = kz_binary:join(RedirectUri, <<"">>),
+    lager:info("zkeycloak kerberos_auth_url final: ~s", [Url]),
+    Url.
 
 -spec retrieve_token(kz_term:ne_binary()) -> any().
 retrieve_token(AuthCode) ->
