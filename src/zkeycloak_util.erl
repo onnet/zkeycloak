@@ -21,6 +21,7 @@
         ,kerberos_auth_url/0
         ,kerberos_auth_url/1
         ,auth_method/1
+        ,logout_url/0
         ]
        ).
 
@@ -249,4 +250,15 @@ auth_method(Token) ->
         <<"1">> -> 'oidc';
         _ -> 'unknown'
     end.
+
+-spec logout_url() -> kz_term:ne_binary().
+logout_url() ->
+    Issuer = issuer(),
+    ClientId = client_id(),
+    RedirectUri = redirect_uri(),
+    EndSession = <<Issuer/binary, "/protocol/openid-connect/logout">>,
+    Params = uri_string:compose_query([{<<"client_id">>, ClientId}
+                                      ,{<<"post_logout_redirect_uri">>, RedirectUri}
+                                      ]),
+    <<EndSession/binary, "?", Params/binary>>.
 

@@ -20,6 +20,7 @@
 -define(AUTH_LINK, <<"auth_link">>).
 -define(AUTH_CALLBACK, <<"auth_callback">>).
 -define(KERBEROS_LOGIN, <<"kerberos_login">>).
+-define(LOGOUT, <<"logout">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
 -spec init() -> ok.
@@ -38,6 +39,7 @@ allowed_methods() -> [?HTTP_POST, ?HTTP_GET].
 allowed_methods(?AUTH_LINK) -> [?HTTP_GET];
 allowed_methods(?AUTH_CALLBACK) -> [?HTTP_GET];
 allowed_methods(?KERBEROS_LOGIN) -> [?HTTP_GET];
+allowed_methods(?LOGOUT) -> [?HTTP_GET];
 allowed_methods(?ZKEYCLOAK) -> [?HTTP_POST, ?HTTP_GET].
 
 -spec resource_exists() -> boolean().
@@ -46,6 +48,7 @@ resource_exists() -> 'true'.
 resource_exists(?AUTH_LINK) -> 'true';
 resource_exists(?AUTH_CALLBACK) -> 'true';
 resource_exists(?KERBEROS_LOGIN) -> 'true';
+resource_exists(?LOGOUT) -> 'true';
 resource_exists(?ZKEYCLOAK) -> 'true'.
 
 -spec authorize(cb_context:context()) -> boolean() | {'stop', cb_context:context()}.
@@ -81,6 +84,9 @@ authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}], Method
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}], Method) when Method =:= ?HTTP_GET ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing kerberos_login"),
     'true';
+authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}], Method) when Method =:= ?HTTP_GET ->
+    lager:info("authorize_nouns_zkeycloak_ext authorizing logout"),
+    'true';
 authorize_nouns(_, _Nouns, _) ->
     lager:info("authorize_nouns_zkeycloak_ext undefined _Nouns: ~p", [_Nouns]),
     'false'.
@@ -105,6 +111,8 @@ authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_link">>]}]) ->
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}]) ->
     'true';
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}]) ->
+    'true';
+authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}]) ->
     'true';
 authenticate_nouns(_Context, _Nouns) ->
     lager:info("authenticate_nouns/1 _Nouns: ~p",[_Nouns]),
@@ -180,6 +188,11 @@ validate(Context, ?KERBEROS_LOGIN) ->
         'false' ->
             cb_context:add_system_error('forbidden', Context)
     end;
+validate(Context, ?LOGOUT) ->
+    LogoutUrl = zkeycloak_util:logout_url(),
+    lager:info("zkeycloak logout_url: ~s", [LogoutUrl]),
+    JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
+    cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
