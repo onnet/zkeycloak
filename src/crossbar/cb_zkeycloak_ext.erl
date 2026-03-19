@@ -241,5 +241,5 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
                ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
                ,{<<"auth_method">>, AuthMethod}
                ])),
-    crossbar_auth:create_auth_token(Context, <<"cb_zkeycloak_ext">>, JObj).
+    crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj), 'cb_zkeycloak_ext').
 
