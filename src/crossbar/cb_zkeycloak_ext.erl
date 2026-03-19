@@ -233,18 +233,13 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
     end,
     UserInfoJObj = kz_json:from_map(UserInfoMap),
     lager:info("provide_keycloak_token/2  UserInfoJObj: ~p",[UserInfoJObj]),
-    Setters = [{fun cb_context:set_auth_token/2, TokenAccess}
-              ,{fun cb_context:set_auth_doc/2, UserInfoJObj}
-              ],
     AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
-    Props = props:filter_undefined(
-              [{<<"account_id">>, AccountId}
-              ,{<<"owner_id">>, OwnerId}
-              ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
-              ,{<<"auth_method">>, AuthMethod}
-              ]),
-    Resp = crossbar_util:response_auth(kz_json:from_list(Props), AccountId, OwnerId),
-    Context1 = cb_context:setters(Context, Setters),
-    Context2 = crossbar_auth:set_auth_cookie(Context1, TokenAccess),
-    crossbar_util:response(Resp, Context2).
+    JObj = kz_json:from_list(
+             props:filter_undefined(
+               [{<<"account_id">>, AccountId}
+               ,{<<"owner_id">>, OwnerId}
+               ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
+               ,{<<"auth_method">>, AuthMethod}
+               ])),
+    crossbar_auth:create_auth_token(Context, <<"cb_zkeycloak_ext">>, JObj).
 
