@@ -244,5 +244,7 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
               ,{<<"auth_method">>, AuthMethod}
               ]),
     Resp = crossbar_util:response_auth(kz_json:from_list(Props), AccountId, OwnerId),
-    crossbar_util:response(Resp, cb_context:setters(Context, Setters)).
+    Context1 = cb_context:setters(Context, Setters),
+    Context2 = crossbar_auth:set_auth_cookie(Context1, TokenAccess),
+    crossbar_util:response(Resp, Context2).
 
