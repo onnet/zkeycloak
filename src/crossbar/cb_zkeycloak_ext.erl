@@ -234,12 +234,14 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
     UserInfoJObj = kz_json:from_map(UserInfoMap),
     lager:info("provide_keycloak_token/2  UserInfoJObj: ~p",[UserInfoJObj]),
     AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
+    AccountName = kz_maps:get(<<"account_name">>, UserInfoMap, 'undefined'),
     JObj = kz_json:from_list(
              props:filter_undefined(
                [{<<"account_id">>, AccountId}
                ,{<<"owner_id">>, OwnerId}
                ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
                ,{<<"auth_method">>, AuthMethod}
+               ,{<<"account_name">>, AccountName}
                ])),
     crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj), 'cb_zkeycloak_ext').
 
