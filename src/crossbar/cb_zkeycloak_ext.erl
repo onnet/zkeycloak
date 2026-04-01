@@ -161,7 +161,7 @@ validate(Context, ?AUTH_CALLBACK) ->
 
             UserInfoMap = zkeycloak_util:retrieve_userinfo(TokenTuple),
             lager:info("validate_ext/2  UserInfoMap: ~p",[UserInfoMap]),
-            UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap),
+            UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap, []),
             case lists:member(<<"onbill_access">>, UserInfoRoles) of
                 'true' ->
                     provide_keycloak_token(Context, TokenAccess, UserInfoMap);
