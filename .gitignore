@@ -1,0 +1,8 @@
+.deps.mk
+.deps.mk.
+.deps.rules
+.test.deps
+*.beam
+*.app
+ebin/
+tmp/
