@@ -151,7 +151,12 @@ validate(Context, ?AUTH_CALLBACK) ->
     %% /authorize через AppAuth с собственным `ru.brt.zfield://oauth/callback`.
     RedirectUri = kz_json:get_ne_binary_value(<<"redirect_uri">>, QS,
                                               zkeycloak_util:redirect_uri()),
-    case zkeycloak_util:retrieve_token(Code, RedirectUri) of
+    %% PKCE code_verifier — опционален. Mobile-клиенты (zfield/AppAuth)
+    %% всегда инициируют /authorize c `code_challenge` (S256), и KC
+    %% требует исходный verifier в /token. Web-flow zfront пока без
+    %% PKCE — передаёт 'undefined', oidcc не добавит pkce_verifier в /token.
+    PkceVerifier = kz_json:get_ne_binary_value(<<"code_verifier">>, QS),
+    case zkeycloak_util:retrieve_token(Code, RedirectUri, PkceVerifier) of
         {oidcc_token
         ,{oidcc_token_id, TokenId, ClaimsMap}
         ,{oidcc_token_access, TokenAccess, _Timeout, _Type}

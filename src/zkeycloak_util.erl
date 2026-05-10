@@ -9,6 +9,7 @@
         ,preferred_auth_methods/0
         ,retrieve_token/1
         ,retrieve_token/2
+        ,retrieve_token/3
         ,retrieve_userinfo/1
         ,introspect_token/1
         ,refresh_token/1
@@ -133,16 +134,33 @@ retrieve_token(AuthCode) ->
 %% config) — обратная совместимость сохранена.
 -spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary()) -> any().
 retrieve_token(AuthCode, RedirectUri) ->
-    lager:info("zkeycloak retrieve_token redirect_uri: ~s", [RedirectUri]),
+    retrieve_token(AuthCode, RedirectUri, 'undefined').
+
+%% @doc Token exchange c явным redirect_uri и опциональным PKCE verifier'ом.
+%% Mobile-клиенты (zfield) проходят /authorize через AppAuth, который
+%% автоматически генерирует `code_verifier` + `code_challenge=S256`.
+%% KC привязывает code к challenge'у — в /token нужен исходный verifier,
+%% иначе KC отвечает 'invalid_grant: PKCE code verifier not specified'.
+%% Web-flow без PKCE передаёт PkceVerifier='undefined' — opts без
+%% pkce_verifier, oidcc не добавит его в /token request.
+-spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary(), kz_term:api_ne_binary()) -> any().
+retrieve_token(AuthCode, RedirectUri, PkceVerifier) ->
+    lager:info("zkeycloak retrieve_token redirect_uri: ~s pkce: ~s",
+               [RedirectUri, case PkceVerifier of 'undefined' -> <<"no">>; _ -> <<"yes">> end]),
+    BaseOpts = #{'redirect_uri' => RedirectUri
+                ,'preferred_auth_methods' => preferred_auth_methods()
+                },
+    Opts = case PkceVerifier of
+               'undefined' -> BaseOpts;
+               _ -> BaseOpts#{'pkce_verifier' => PkceVerifier}
+           end,
     {ok, Token} =
         oidcc:retrieve_token(
           AuthCode
          ,client_id_atom()
          ,client_id()
          ,client_secret()
-         ,#{'redirect_uri' => RedirectUri
-           ,'preferred_auth_methods' => preferred_auth_methods()
-           }
+         ,Opts
          ),
     Token.
 
