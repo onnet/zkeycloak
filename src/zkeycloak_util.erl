@@ -8,6 +8,7 @@
         ,redirect_uri/0
         ,preferred_auth_methods/0
         ,retrieve_token/1
+        ,retrieve_token/2
         ,retrieve_userinfo/1
         ,introspect_token/1
         ,refresh_token/1
@@ -122,13 +123,24 @@ kerberos_auth_url(ExtraOpts) ->
 
 -spec retrieve_token(kz_term:ne_binary()) -> any().
 retrieve_token(AuthCode) ->
+    retrieve_token(AuthCode, redirect_uri()).
+
+%% @doc Token exchange c явным redirect_uri (от клиента).
+%% Нужно для mobile-клиентов (zfield) — они проходят /authorize через
+%% свой deep-link (`ru.brt.zfield://oauth/callback`), а KC требует
+%% совпадения redirect_uri в /authorize и /token. Web (zfront) шлёт
+%% свой redirect_uri в QS либо вызывает retrieve_token/1 (default
+%% config) — обратная совместимость сохранена.
+-spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary()) -> any().
+retrieve_token(AuthCode, RedirectUri) ->
+    lager:info("zkeycloak retrieve_token redirect_uri: ~s", [RedirectUri]),
     {ok, Token} =
         oidcc:retrieve_token(
           AuthCode
          ,client_id_atom()
          ,client_id()
          ,client_secret()
-         ,#{'redirect_uri' => redirect_uri()
+         ,#{'redirect_uri' => RedirectUri
            ,'preferred_auth_methods' => preferred_auth_methods()
            }
          ),

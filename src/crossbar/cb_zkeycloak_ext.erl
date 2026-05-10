@@ -145,7 +145,13 @@ validate(Context, ?AUTH_CALLBACK) ->
     lager:info("validate_ext/2  cb_context:query_string: ~p",[cb_context:query_string(Context)]),
     QS = cb_context:query_string(Context),
     Code = kz_json:get_ne_binary_value(<<"code">>, QS),
-    case zkeycloak_util:retrieve_token(Code) of
+    %% Если клиент прислал свой redirect_uri (mobile-flow с deep-link'ом)
+    %% — берём его, иначе fallback на config (web-flow zfront). KC требует
+    %% совпадения redirect_uri в /authorize и /token, mobile проходит
+    %% /authorize через AppAuth с собственным `ru.brt.zfield://oauth/callback`.
+    RedirectUri = kz_json:get_ne_binary_value(<<"redirect_uri">>, QS,
+                                              zkeycloak_util:redirect_uri()),
+    case zkeycloak_util:retrieve_token(Code, RedirectUri) of
         {oidcc_token
         ,{oidcc_token_id, TokenId, ClaimsMap}
         ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
