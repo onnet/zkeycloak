@@ -251,8 +251,33 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
                [{<<"account_id">>, AccountId}
                ,{<<"owner_id">>, OwnerId}
                ,{<<"keycloak_resource_access">>, kz_json:get_value(<<"resource_access">>, UserInfoJObj)}
+               ,{<<"kc_full_name">>, build_full_name(UserInfoJObj)}
                ,{<<"auth_method">>, AuthMethod}
                ,{<<"account_name">>, AccountName}
                ])),
     crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj), 'cb_zkeycloak_ext').
+
+%%------------------------------------------------------------------------------
+%% @doc Собрать полное ФИО для auth-doc'а: `given_name' + ` ' + `family_name'.
+%% Используется `zpaparazzi_authz:can_*_epl/3' для сопоставления с
+%% `driver_fio' из EPL-doc'а через `zcore_util_fio_match:matches/2'.
+%% Fallback: `name' (если Keycloak не отдаёт given/family), затем
+%% `preferred_username'. Возвращает `'undefined'' если ничего нет —
+%% `props:filter_undefined' убирает ключ из auth-doc'а.
+%% @end
+%%------------------------------------------------------------------------------
+-spec build_full_name(kz_json:object()) -> kz_term:api_ne_binary().
+build_full_name(UserInfoJObj) ->
+    Given  = kz_json:get_ne_binary_value(<<"given_name">>, UserInfoJObj),
+    Family = kz_json:get_ne_binary_value(<<"family_name">>, UserInfoJObj),
+    case {Given, Family} of
+        {'undefined', 'undefined'} ->
+            case kz_json:get_ne_binary_value(<<"name">>, UserInfoJObj) of
+                'undefined' -> kz_json:get_ne_binary_value(<<"preferred_username">>, UserInfoJObj);
+                Name -> Name
+            end;
+        {'undefined', F} -> F;
+        {G, 'undefined'} -> G;
+        {G, F} -> <<G/binary, " ", F/binary>>
+    end.
 
