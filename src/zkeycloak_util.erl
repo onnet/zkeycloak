@@ -221,13 +221,21 @@ refresh_token(RefreshToken) ->
         %% Если refresh битый — oidcc вернёт invalid_grant.
         ExpectedSub = jwt_sub_unverified(RefreshToken),
         lager:info("zkeycloak refresh_token expected_subject=~s", [ExpectedSub]),
+        %% `preferred_auth_methods' нужен, иначе oidcc выбирает дефолтный
+        %% client-auth метод, который KC отвергает для confidential client
+        %% `onbill_client': получаем "unauthorized_client / Invalid client
+        %% credentials". В `retrieve_token' это уже передаётся (line 151),
+        %% забывать в refresh нельзя.
+        Opts = #{'expected_subject' => ExpectedSub
+                ,'preferred_auth_methods' => preferred_auth_methods()
+                },
         Result =
             oidcc:refresh_token(
               RefreshToken
              ,client_id_atom()
              ,client_id()
              ,client_secret()
-             ,#{'expected_subject' => ExpectedSub}
+             ,Opts
              ),
         lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
         case Result of
