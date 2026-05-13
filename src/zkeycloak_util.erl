@@ -196,20 +196,37 @@ introspect_token(Token) ->
 %% клиентом) KC возвращает новый refresh_token при каждом успешном вызове;
 %% старый остаётся валидным (`Revoke Refresh Token' = Disabled) — это
 %% упрощает retry-пайплайн на стороне Flutter (race-condition безопасен).
+%%
+%% oidcc 3.x при невалидном refresh может ЛИБО вернуть `{error, _}', ЛИБО
+%% выбросить exception (зависит от того, на каком этапе сломалось — парсинг
+%% JWT, http-ответ от KC, JWKS-валидация). Заворачиваем в try-catch и
+%% нормализуем к единому `{ok, _} | {error, _}' контракту — без этого
+%% `cb_zkeycloak_ext:handle_refresh' получал crash и Crossbar отвечал 500.
 -spec refresh_token(kz_term:ne_binary()) ->
           {'ok', tuple()} | {'error', any()}.
 refresh_token(RefreshToken) ->
     lager:info("zkeycloak refresh_token: client_id=~s", [client_id()]),
-    Result =
-        oidcc:refresh_token(
-          RefreshToken
-         ,client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,#{}
-         ),
-    lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
-    Result.
+    try
+        Result =
+            oidcc:refresh_token(
+              RefreshToken
+             ,client_id_atom()
+             ,client_id()
+             ,client_secret()
+             ,#{}
+             ),
+        lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
+        case Result of
+            {'ok', _} -> Result;
+            {'error', _} -> Result;
+            Other -> {'error', {'unexpected_oidcc_result', Other}}
+        end
+    catch
+        Class:Reason:Stack ->
+            lager:warning("zkeycloak refresh_token exception ~p:~p stack=~p",
+                          [Class, Reason, Stack]),
+            {'error', {Class, Reason}}
+    end.
 
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
