@@ -213,7 +213,13 @@ refresh_token(RefreshToken) ->
         %% id_token (это и есть инвариант, который oidcc проверяет).
         %% Без этой опции `oidcc_token:refresh/3' падает на line 544
         %% `map_get(expected_subject, Opts) -> badkey'.
-        ExpectedSub = props:get_ne_binary_value(<<"sub">>, jwt_claims(RefreshToken)),
+        %%
+        %% Парсим refresh БЕЗ верификации подписи: KC подписывает refresh
+        %% HS256 (client-secret), а `kz_auth_jwt' умеет только asymmetric
+        %% (RS256/ES256). Это OK — мы не проверяем подлинность здесь,
+        %% криптографическую верификацию делает сам KC при /token/refresh.
+        %% Если refresh битый — oidcc вернёт invalid_grant.
+        ExpectedSub = jwt_sub_unverified(RefreshToken),
         lager:info("zkeycloak refresh_token expected_subject=~s", [ExpectedSub]),
         Result =
             oidcc:refresh_token(
@@ -280,6 +286,24 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
 jwt_claims(Token) ->
     {ok, _Heder, Claims} = kz_auth_jwt:decode(Token),
     Claims.
+
+%% @doc Извлечь `sub' claim из JWT без верификации подписи. Нужно для
+%% refresh-токенов KC: они подписаны HS256 (client-secret), а
+%% `kz_auth_jwt:decode' принимает только asymmetric (RS256/ES256) и
+%% возвращает `verify_failed'. Криптографическую проверку всё равно
+%% делает KC при /token/refresh — здесь нам нужен только субъект, чтобы
+%% передать его в `oidcc:refresh_token/5' opts (`expected_subject').
+-spec jwt_sub_unverified(kz_term:ne_binary()) -> kz_term:ne_binary().
+jwt_sub_unverified(Token) ->
+    [_Header, Payload, _Sig] = binary:split(Token, <<".">>, ['global']),
+    Padded = case byte_size(Payload) rem 4 of
+                 0 -> Payload;
+                 2 -> <<Payload/binary, "==">>;
+                 3 -> <<Payload/binary, "=">>
+             end,
+    Bin = base64:decode(Padded, #{'mode' => 'urlsafe'}),
+    Claims = kz_json:decode(Bin),
+    kz_json:get_ne_binary_value(<<"sub">>, Claims).
 
 -spec jwt_iss(kz_term:ne_binary()) -> kz_term:proplist().
 jwt_iss(Token) ->
