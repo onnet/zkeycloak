@@ -21,6 +21,7 @@
 -define(AUTH_CALLBACK, <<"auth_callback">>).
 -define(KERBEROS_LOGIN, <<"kerberos_login">>).
 -define(LOGOUT, <<"logout">>).
+-define(REFRESH, <<"refresh">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
 -spec init() -> ok.
@@ -40,6 +41,7 @@ allowed_methods(?AUTH_LINK) -> [?HTTP_GET];
 allowed_methods(?AUTH_CALLBACK) -> [?HTTP_GET];
 allowed_methods(?KERBEROS_LOGIN) -> [?HTTP_GET];
 allowed_methods(?LOGOUT) -> [?HTTP_GET];
+allowed_methods(?REFRESH) -> [?HTTP_POST];
 allowed_methods(?ZKEYCLOAK) -> [?HTTP_POST, ?HTTP_GET].
 
 -spec resource_exists() -> boolean().
@@ -49,6 +51,7 @@ resource_exists(?AUTH_LINK) -> 'true';
 resource_exists(?AUTH_CALLBACK) -> 'true';
 resource_exists(?KERBEROS_LOGIN) -> 'true';
 resource_exists(?LOGOUT) -> 'true';
+resource_exists(?REFRESH) -> 'true';
 resource_exists(?ZKEYCLOAK) -> 'true'.
 
 -spec authorize(cb_context:context()) -> boolean() | {'stop', cb_context:context()}.
@@ -87,6 +90,9 @@ authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}], Metho
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}], Method) when Method =:= ?HTTP_GET ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing logout"),
     'true';
+authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"refresh">>]}], Method) when Method =:= ?HTTP_POST ->
+    lager:info("authorize_nouns_zkeycloak_ext authorizing refresh"),
+    'true';
 authorize_nouns(_, _Nouns, _) ->
     lager:info("authorize_nouns_zkeycloak_ext undefined _Nouns: ~p", [_Nouns]),
     'false'.
@@ -113,6 +119,8 @@ authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}]) ->
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}]) ->
     'true';
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}]) ->
+    'true';
+authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"refresh">>]}]) ->
     'true';
 authenticate_nouns(_Context, _Nouns) ->
     lager:info("authenticate_nouns/1 _Nouns: ~p",[_Nouns]),
@@ -175,7 +183,7 @@ validate(Context, ?AUTH_CALLBACK) ->
             UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap, []),
             case lists:member(<<"onbill_access">>, UserInfoRoles) of
                 'true' ->
-                    provide_keycloak_token(Context, TokenAccess, UserInfoMap);
+                    provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap);
                 'false' ->
                     lager:info("validate_ext/2  insufficient UserInfoRoles: ~p",[UserInfoRoles]),
                     cb_context:add_system_error('insufficient_role', Context)
@@ -204,6 +212,25 @@ validate(Context, ?LOGOUT) ->
     lager:info("zkeycloak logout_url: ~s", [LogoutUrl]),
     JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+%% @doc Обмен refresh_token → новый Kazoo auth_token + новый KC refresh/id.
+%% Mobile-клиенты (zfield) хранят `kc_refresh_token' в secure_storage под
+%% BiometricPrompt и дёргают эту ручку при cold-start (после биометрии) и
+%% при 401 от Kazoo. Тело запроса: `{"data":{"refresh_token":"..."}}'
+%% (стандартный Crossbar-конверт). Ответ — расширение auth_callback'а:
+%% Kazoo auth_token + `kc_refresh_token' (новый, ротированный KC) +
+%% `kc_id_token' (для последующего end-session). Ошибки KC (`invalid_grant',
+%% истёкший/отозванный refresh) → `invalid_credentials' → клиент идёт в
+%% полный AppAuth-flow.
+validate(Context, ?REFRESH) ->
+    ReqData = cb_context:req_data(Context),
+    RefreshToken = kz_json:get_ne_binary_value(<<"refresh_token">>, ReqData),
+    case RefreshToken of
+        'undefined' ->
+            lager:info("validate_ext/2 refresh: missing refresh_token in body"),
+            cb_context:add_system_error('invalid_credentials', Context);
+        _ ->
+            handle_refresh(Context, RefreshToken)
+    end;
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
@@ -227,7 +254,43 @@ zkeycloak_ext_post(Context) ->
     lager:info("zkeycloak_ext_post/1 req_json: ~p",[ReqJSON]),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, kz_json:new()), 'success').
 
-provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
+%% @doc Обмен refresh_token на KC и формирование Kazoo-сессии.
+%% Структура oidcc-tuple строится в zkeycloak_util:retrieve_token; здесь
+%% подхватываем её один-в-один (`oidcc_token_*' records определены в
+%% `oidcc/include/oidcc_token.hrl').
+-spec handle_refresh(cb_context:context(), kz_term:ne_binary()) ->
+          cb_context:context().
+handle_refresh(Context, RefreshToken) ->
+    case zkeycloak_util:refresh_token(RefreshToken) of
+        {'ok', {oidcc_token
+               ,{oidcc_token_id, NewTokenId, _ClaimsMap}
+               ,{oidcc_token_access, NewTokenAccess, _Timeout, _Type}
+               ,{oidcc_token_refresh, NewTokenRefresh}
+               ,_Scope
+               } = TokenTuple} ->
+            lager:info("handle_refresh: ok, new_access=~s new_refresh=~s",
+                       [NewTokenAccess, NewTokenRefresh]),
+            UserInfoMap = zkeycloak_util:retrieve_userinfo(TokenTuple),
+            UserInfoRoles = kz_maps:get([<<"resource_access">>
+                                        ,<<"onbill_client">>
+                                        ,<<"roles">>], UserInfoMap, []),
+            case lists:member(<<"onbill_access">>, UserInfoRoles) of
+                'true' ->
+                    provide_keycloak_token(Context, NewTokenAccess, NewTokenId,
+                                           NewTokenRefresh, UserInfoMap);
+                'false' ->
+                    lager:info("handle_refresh: insufficient roles ~p", [UserInfoRoles]),
+                    cb_context:add_system_error('insufficient_role', Context)
+            end;
+        {'error', Reason} ->
+            lager:info("handle_refresh: KC error ~p — invalid_grant flow", [Reason]),
+            cb_context:add_system_error('invalid_credentials', Context);
+        Other ->
+            lager:info("handle_refresh: unexpected oidcc result ~p", [Other]),
+            cb_context:add_system_error('invalid_credentials', Context)
+    end.
+
+provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap) ->
     AccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
     OwnerId = zbrt_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap)),
     DbName = kzs_util:format_account_id(AccountId, 'encoded'),
@@ -243,7 +306,7 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
             zkeycloak_util:create_user(AccountId, OwnerId, Firstname, Surname, Email, Phonenumber, UserPassword)
     end,
     UserInfoJObj = kz_json:from_map(UserInfoMap),
-    lager:info("provide_keycloak_token/2  UserInfoJObj: ~p",[UserInfoJObj]),
+    lager:info("provide_keycloak_token/5  UserInfoJObj: ~p",[UserInfoJObj]),
     AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
     AccountName = kz_maps:get(<<"account_name">>, UserInfoMap, 'undefined'),
     JObj = kz_json:from_list(
@@ -255,7 +318,36 @@ provide_keycloak_token(Context, TokenAccess, UserInfoMap) ->
                ,{<<"auth_method">>, AuthMethod}
                ,{<<"account_name">>, AccountName}
                ])),
-    crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj), 'cb_zkeycloak_ext').
+    Ctx1 = crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj),
+                                           'cb_zkeycloak_ext'),
+    %% После create_auth_token resp_data содержит kazoo-конверт с auth_token.
+    %% Подмешиваем `kc_refresh_token' и `kc_id_token' — нужны mobile-клиенту
+    %% (zfield) для biometric-flow: refresh хранится в secure_storage под
+    %% BiometricPrompt, id_token используется для KC end-session при logout.
+    %% Web-клиент (zfront) поля игнорирует — обратная совместимость сохранена.
+    enrich_resp_with_kc_tokens(Ctx1, TokenId, TokenRefresh).
+
+%% @doc Добавить kc_refresh_token + kc_id_token в resp_data.
+-spec enrich_resp_with_kc_tokens(cb_context:context()
+                                ,kz_term:ne_binary()
+                                ,kz_term:ne_binary()
+                                ) -> cb_context:context().
+enrich_resp_with_kc_tokens(Context, TokenId, TokenRefresh) ->
+    case cb_context:resp_status(Context) of
+        'success' ->
+            RespData0 = case cb_context:resp_data(Context) of
+                            'undefined' -> kz_json:new();
+                            Existing -> Existing
+                        end,
+            RespData1 = kz_json:set_values(
+                          props:filter_undefined(
+                            [{<<"kc_refresh_token">>, TokenRefresh}
+                            ,{<<"kc_id_token">>, TokenId}
+                            ]), RespData0),
+            cb_context:set_resp_data(Context, RespData1);
+        _ ->
+            Context
+    end.
 
 %%------------------------------------------------------------------------------
 %% @doc Собрать полное ФИО для auth-doc'а: `given_name' + ` ' + `family_name'.

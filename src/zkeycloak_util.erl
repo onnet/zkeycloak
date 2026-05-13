@@ -188,17 +188,28 @@ introspect_token(Token) ->
          ),
     Introspection.
 
--spec refresh_token(kz_term:ne_binary()) -> any().
-refresh_token(Token) ->
-    {ok, RefreshedToken} =
-        oidcc:introspect_token(
-          Token
+%% @doc Обмен refresh_token → новый набор токенов (access + refresh + id_token).
+%% Зfield (mobile) хранит refresh_token в secure_storage под BiometricPrompt и
+%% дёргает эту функцию через `POST /zkeycloak_ext/refresh' — взамен полного
+%% AppAuth-flow на КЛ-форме. Для нашей конфигурации realm (Offline Session
+%% Idle = 30 дней, Max = unlimited, scope `offline_access' запрашивается явно
+%% клиентом) KC возвращает новый refresh_token при каждом успешном вызове;
+%% старый остаётся валидным (`Revoke Refresh Token' = Disabled) — это
+%% упрощает retry-пайплайн на стороне Flutter (race-condition безопасен).
+-spec refresh_token(kz_term:ne_binary()) ->
+          {'ok', tuple()} | {'error', any()}.
+refresh_token(RefreshToken) ->
+    lager:info("zkeycloak refresh_token: client_id=~s", [client_id()]),
+    Result =
+        oidcc:refresh_token(
+          RefreshToken
          ,client_id_atom()
          ,client_id()
          ,client_secret()
          ,#{}
          ),
-    RefreshedToken.
+    lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
+    Result.
 
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
