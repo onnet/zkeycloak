@@ -207,13 +207,21 @@ introspect_token(Token) ->
 refresh_token(RefreshToken) ->
     lager:info("zkeycloak refresh_token: client_id=~s", [client_id()]),
     try
+        %% oidcc 3.x требует `expected_subject' в opts — защита от
+        %% substitute-атаки (KC не должен подменить user'а при refresh).
+        %% Берём sub из payload refresh JWT — он совпадает с sub нового
+        %% id_token (это и есть инвариант, который oidcc проверяет).
+        %% Без этой опции `oidcc_token:refresh/3' падает на line 544
+        %% `map_get(expected_subject, Opts) -> badkey'.
+        ExpectedSub = props:get_ne_binary_value(<<"sub">>, jwt_claims(RefreshToken)),
+        lager:info("zkeycloak refresh_token expected_subject=~s", [ExpectedSub]),
         Result =
             oidcc:refresh_token(
               RefreshToken
              ,client_id_atom()
              ,client_id()
              ,client_secret()
-             ,#{}
+             ,#{'expected_subject' => ExpectedSub}
              ),
         lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
         case Result of
