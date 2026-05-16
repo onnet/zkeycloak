@@ -6,3 +6,6 @@
 *.app
 ebin/
 tmp/
+cover/
+*.coverdata
+log/
