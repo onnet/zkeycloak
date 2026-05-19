@@ -292,8 +292,23 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
 
 -spec jwt_claims(kz_term:ne_binary()) -> kz_term:proplist().
 jwt_claims(Token) ->
-    {ok, _Heder, Claims} = kz_auth_jwt:decode(Token),
-    Claims.
+    %% Верифицированные claims; на истёкшем/невалидном токене — пустой список.
+    case decode_safe(Token, 'true') of
+        {'ok', _Header, Claims} -> Claims;
+        {'error', _Reason} -> []
+    end.
+
+%% @doc Обёртка над `kz_auth_jwt:decode/2': помимо `{error,_}' ловит и
+%% исключения от парсинга произвольного auth-токена (не-JWT, битый base64).
+%% `Verify' = `false' — только распарсить payload (routing-решение), без
+%% криптопроверки; её делает downstream `kz_auth:validate_token/2'.
+-spec decode_safe(kz_term:ne_binary(), boolean()) ->
+          {'ok', kz_term:proplist(), kz_term:proplist()} | {'error', any()}.
+decode_safe(Token, Verify) ->
+    try kz_auth_jwt:decode(Token, Verify)
+    catch
+        _E:_R -> {'error', 'invalid_jwt'}
+    end.
 
 %% @doc Извлечь `sub' claim из JWT без верификации подписи. Нужно для
 %% refresh-токенов KC: они подписаны HS256 (client-secret), а
@@ -313,30 +328,43 @@ jwt_sub_unverified(Token) ->
     Claims = kz_json:decode(Bin),
     kz_json:get_ne_binary_value(<<"sub">>, Claims).
 
--spec jwt_iss(kz_term:ne_binary()) -> kz_term:proplist().
+-spec jwt_iss(kz_term:ne_binary()) -> kz_term:api_ne_binary().
 jwt_iss(Token) ->
-    Claims = jwt_claims(Token),
-    props:get_ne_binary_value(<<"iss">>, Claims).
+    %% routing-решение «KC-токен?»: криптопроверка не нужна.
+    case decode_safe(Token, 'false') of
+        {'ok', _Header, Claims} -> props:get_ne_binary_value(<<"iss">>, Claims);
+        {'error', _Reason} -> 'undefined'
+    end.
 
 -spec maybe_keycloak_token(kz_term:ne_binary()) -> boolean().
 maybe_keycloak_token(Token) ->
     jwt_iss(Token) == issuer().
 
--spec maybe_keycloak_token_validate(kz_term:ne_binary(), kz_term:proplist()) -> boolean().
+-spec maybe_keycloak_token_validate(kz_term:ne_binary(), kz_term:proplist()) ->
+          {'ok', 'not_keycloack_token' | 'onbill_access_provided'} |
+          {'error', any()}.
 maybe_keycloak_token_validate(Token, _Options) ->
     case maybe_keycloak_token(Token) of
         'false' ->
             {'ok', 'not_keycloack_token'};
         'true' ->
-            Claims = jwt_claims(Token),
-            ResourceAccessMap = props:get_value(<<"resource_access">>, Claims),
-            ClientRoles = kz_maps:get([<<"onbill_client">>,<<"roles">>], ResourceAccessMap),
+            validate_onbill_access(Token)
+    end.
+
+-spec validate_onbill_access(kz_term:ne_binary()) ->
+          {'ok', 'onbill_access_provided'} | {'error', any()}.
+validate_onbill_access(Token) ->
+    case decode_safe(Token, 'true') of
+        {'ok', _Header, Claims} ->
+            ResourceAccess = props:get_value(<<"resource_access">>, Claims, #{}),
+            ClientRoles = kz_maps:get([<<"onbill_client">>, <<"roles">>], ResourceAccess, []),
             case lists:member(<<"onbill_access">>, ClientRoles) of
-                'true' ->
-                    {'ok', 'onbill_access_provided'};
-                'false' ->
-                    {'error', 'onbill_access_absent'}
-            end
+                'true' -> {'ok', 'onbill_access_provided'};
+                'false' -> {'error', 'onbill_access_absent'}
+            end;
+        {'error', Reason} ->
+            lager:debug("keycloak token rejected: ~p", [Reason]),
+            {'error', Reason}
     end.
 
 -spec auth_method(kz_term:ne_binary()) -> 'oidc' | 'kerberos' | 'unknown'.
