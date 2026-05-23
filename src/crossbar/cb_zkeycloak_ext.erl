@@ -208,8 +208,16 @@ validate(Context, ?KERBEROS_LOGIN) ->
             cb_context:add_system_error('forbidden', Context)
     end;
 validate(Context, ?LOGOUT) ->
-    LogoutUrl = zkeycloak_util:logout_url(),
-    lager:info("zkeycloak logout_url: ~s", [LogoutUrl]),
+    %% `id_token_hint' приходит из QS — фронт берёт его из своего state
+    %% (`kc_id_token', enrich_resp_with_kc_tokens/3 положил его в auth-response).
+    %% Без hint'а KC показывает confirmation page по OIDC-спеке.
+    QS = cb_context:query_string(Context),
+    IdTokenHint = kz_json:get_ne_binary_value(<<"id_token_hint">>, QS),
+    LogoutUrl = zkeycloak_util:logout_url(IdTokenHint),
+    lager:info("zkeycloak logout_url (id_token_hint=~s): ~s"
+              ,[case IdTokenHint of 'undefined' -> <<"no">>; _ -> <<"yes">> end
+               ,LogoutUrl
+               ]),
     JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 %% @doc Обмен refresh_token → новый Kazoo auth_token + новый KC refresh/id.

@@ -24,6 +24,7 @@
         ,kerberos_auth_url/1
         ,auth_method/1
         ,logout_url/0
+        ,logout_url/1
         ]
        ).
 
@@ -367,24 +368,49 @@ validate_onbill_access(Token) ->
             {'error', Reason}
     end.
 
--spec auth_method(kz_term:ne_binary()) -> 'oidc' | 'kerberos' | 'unknown'.
+%% @doc Определяет, как именно KC аутентифицировал пользователя.
+%% Маркеры Kerberos: `acr=kerberos' (broker IdP flow) или присутствие
+%% `kerb'/`kerberos'/`spnego' в массиве `amr' (in-flow SPNEGO-authenticator).
+%% Всё остальное в callback'е `cb_zkeycloak_ext' — OIDC по определению
+%% (password form через `brt-unified' flow либо иной не-Kerberos путь).
+%% Возврат `'unknown'' убран намеренно: он ломал logout-ветку во фронте
+%% (фронт скипал end_session, если auth_method не входит в whitelist).
+-spec auth_method(kz_term:ne_binary()) -> 'oidc' | 'kerberos'.
 auth_method(Token) ->
     Claims = jwt_claims(Token),
     Acr = props:get_ne_binary_value(<<"acr">>, Claims, <<>>),
-    case Acr of
-        <<"kerberos">> -> 'kerberos';
-        <<"1">> -> 'oidc';
-        _ -> 'unknown'
+    Amr = props:get_value(<<"amr">>, Claims, []),
+    KerberosInAmr = is_list(Amr)
+        andalso (lists:member(<<"kerb">>, Amr)
+                 orelse lists:member(<<"kerberos">>, Amr)
+                 orelse lists:member(<<"spnego">>, Amr)),
+    case {Acr, KerberosInAmr} of
+        {<<"kerberos">>, _} -> 'kerberos';
+        {_, 'true'} -> 'kerberos';
+        _ -> 'oidc'
     end.
 
 -spec logout_url() -> kz_term:ne_binary().
 logout_url() ->
+    logout_url('undefined').
+
+%% @doc RP-initiated logout URL для KC.
+%% `IdTokenHint' (из callback'а fronto'ом) обязателен по OIDC-спеке для
+%% silent end_session — без него KC показывает confirmation page.
+-spec logout_url(kz_term:api_ne_binary()) -> kz_term:ne_binary().
+logout_url(IdTokenHint) ->
     Issuer = issuer(),
     ClientId = client_id(),
     RedirectUri = redirect_uri(),
     EndSession = <<Issuer/binary, "/protocol/openid-connect/logout">>,
-    Params = uri_string:compose_query([{<<"client_id">>, ClientId}
-                                      ,{<<"post_logout_redirect_uri">>, RedirectUri}
-                                      ]),
-    <<EndSession/binary, "?", Params/binary>>.
+    BaseParams = [{<<"client_id">>, ClientId}
+                 ,{<<"post_logout_redirect_uri">>, RedirectUri}
+                 ],
+    Params = case IdTokenHint of
+                 'undefined' -> BaseParams;
+                 <<>> -> BaseParams;
+                 Hint -> [{<<"id_token_hint">>, Hint} | BaseParams]
+             end,
+    QS = uri_string:compose_query(Params),
+    <<EndSession/binary, "?", QS/binary>>.
 
