@@ -253,12 +253,16 @@ refresh_token(RefreshToken) ->
 
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_binary()
                  ,kz_term:ne_binary()
-                 ,kz_term:ne_binary()
-                 ,kz_term:ne_binary()
-                 ,kz_term:ne_binary()
-                 ,kz_term:ne_binary()
-                 ) -> {'ok', kz_json:object()} | kz_datamgr:data_error().
+                 ) -> {'ok', kz_json:object()}
+                    | {'error', {'validation_errors', kazoo_documents:doc_validation_errors()}
+                              | {'system_error', atom()}
+                              | term()}
+                    | kz_datamgr:data_error().
 create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPassword) ->
     lager:info("create_user AccountId: ~p, UserDocId: ~p, Email: ~p",[AccountId,UserDocId,Email]),
     lager:info("create_user Firstname: ~p",[Firstname]),
@@ -276,8 +280,12 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
     Ctx0 = cb_context:set_account_id(cb_context:new(), AccountId),
     Ctx1 = cb_context:set_db_name(Ctx0, DbName),
     UDoc = kz_json:set_values(Props, ?MK_USER),
+    %% Канонический шейп `kzd_users:validate/3' — три клозы:
+    %% `{true,_} | {validation_errors,_} | {system_error,_}'. `catch'
+    %% дополнительно ловит исключения (`{'EXIT',_}' / throw / error) —
+    %% не теряем их в немое `Err' как раньше.
     case catch kzd_users:validate(AccountId, UserDocId, UDoc) of
-        {true, UDoc1} ->
+        {'true', UDoc1} ->
             UDoc2 = crossbar_doc:update_pvt_parameters(UDoc1, Ctx1),
             UDoc3 = kz_json:set_value(<<"pvt_type">>,<<"user">>,UDoc2),
             Creates = kz_json:to_proplist(UDoc3),
@@ -286,9 +294,17 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
                             ,{'ensure_saved', 'true'}
                             ],
             Result = kz_datamgr:update_doc(DbName, UserDocId, UpdateOptions),
-            lager:info("create_user Result: ~p", [Result]);
-        Err ->
-            lager:info("create_user Err: ~p", [Err])
+            lager:info("create_user Result: ~p", [Result]),
+            Result;
+        {'validation_errors', _} = Err ->
+            lager:info("create_user Err: ~p", [Err]),
+            {'error', Err};
+        {'system_error', _} = Err ->
+            lager:warning("create_user system_error: ~p", [Err]),
+            {'error', Err};
+        Crash ->
+            lager:error("create_user crashed: ~p", [Crash]),
+            {'error', Crash}
     end.
 
 -spec jwt_claims(kz_term:ne_binary()) -> kz_term:proplist().

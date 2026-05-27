@@ -183,7 +183,7 @@ validate(Context, ?AUTH_CALLBACK) ->
             UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap, []),
             case lists:member(<<"onbill_access">>, UserInfoRoles) of
                 'true' ->
-                    provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap);
+                    provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, 'login');
                 'false' ->
                     lager:info("validate_ext/2  insufficient UserInfoRoles: ~p",[UserInfoRoles]),
                     cb_context:add_system_error('insufficient_role', Context)
@@ -285,7 +285,7 @@ handle_refresh(Context, RefreshToken) ->
             case lists:member(<<"onbill_access">>, UserInfoRoles) of
                 'true' ->
                     provide_keycloak_token(Context, NewTokenAccess, NewTokenId,
-                                           NewTokenRefresh, UserInfoMap);
+                                           NewTokenRefresh, UserInfoMap, 'refresh');
                 'false' ->
                     lager:info("handle_refresh: insufficient roles ~p", [UserInfoRoles]),
                     cb_context:add_system_error('insufficient_role', Context)
@@ -298,21 +298,119 @@ handle_refresh(Context, RefreshToken) ->
             cb_context:add_system_error('invalid_credentials', Context)
     end.
 
-provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap) ->
+-spec provide_keycloak_token(cb_context:context()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,map()
+                            ,'login' | 'refresh'
+                            ) -> cb_context:context().
+provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode) ->
     AccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
     OwnerId = zbrt_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap)),
     DbName = kzs_util:format_account_id(AccountId, 'encoded'),
 
+    case check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap) of
+        'ok' ->
+            issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
+                             AccountId, OwnerId);
+        {'error', Reason} ->
+            lager:warning("provide_keycloak_token[~p]: user doc check failed"
+                          " owner_id=~p account_id=~p reason=~p",
+                          [Mode, OwnerId, AccountId, Reason]),
+            reject_user_provisioning(Context, Mode, Reason)
+    end.
+
+%% @doc Login-путь — гарантируем существование user-doc'а (создаём при
+%% необходимости). Refresh-путь — только проверяем существование; на
+%% miss возвращаем тегированную ошибку, чтобы вызывающий смапил её в
+%% `invalid_credentials' и mobile (zfield) пошёл в полный AppAuth-flow
+%% (см. контракт в комментариях handle_refresh выше).
+-spec check_user_doc('login' | 'refresh'
+                    ,kz_term:ne_binary()
+                    ,kz_term:ne_binary()
+                    ,kz_term:ne_binary()
+                    ,map()
+                    ) -> 'ok' | {'error', term()}.
+check_user_doc('login', DbName, AccountId, OwnerId, UserInfoMap) ->
+    ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap);
+check_user_doc('refresh', DbName, _AccountId, OwnerId, _UserInfoMap) ->
     case kz_datamgr:open_doc(DbName, OwnerId) of
         {'ok', _} -> 'ok';
-        _ ->
-            Firstname = kz_maps:get(<<"given_name">>, UserInfoMap),
-            Surname = kz_maps:get(<<"family_name">>, UserInfoMap),
-            Email = kz_maps:get(<<"email">>, UserInfoMap),
-            Phonenumber = <<"">>,
+        Err -> {'error', {'missing_user_doc_on_refresh', Err}}
+    end.
+
+%% @doc Гарантировать, что у `OwnerId' есть user-doc в account-db. Если
+%% не существует — создать; на любой ошибке создания (в т.ч. missing
+%% `last_name' у LDAP-юзера без `sn') — поднять наверх, чтобы вызывающий
+%% отказал в выдаче auth-токена. Инвариант: `auth_token ⇒ есть user-doc'.
+-spec ensure_user_doc(kz_term:ne_binary()
+                     ,kz_term:ne_binary()
+                     ,kz_term:ne_binary()
+                     ,map()
+                     ) -> 'ok' | {'error', term()}.
+ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) ->
+    case kz_datamgr:open_doc(DbName, OwnerId) of
+        {'ok', _} -> 'ok';
+        {'error', 'not_found'} ->
+            Firstname = kz_maps:get(<<"given_name">>, UserInfoMap, 'undefined'),
+            Surname = kz_maps:get(<<"family_name">>, UserInfoMap, 'undefined'),
+            Email = kz_maps:get(<<"email">>, UserInfoMap, 'undefined'),
             UserPassword = kz_binary:rand_hex(12),
-            zkeycloak_util:create_user(AccountId, OwnerId, Firstname, Surname, Email, Phonenumber, UserPassword)
-    end,
+            case zkeycloak_util:create_user(AccountId, OwnerId, Firstname, Surname,
+                                            Email, 'undefined', UserPassword) of
+                {'ok', _} -> 'ok';
+                {'error', _} = Err -> Err
+            end;
+        {'error', _} = OpenErr ->
+            %% Datastore error (timeout/unreachable/…) — НЕ пытаемся re-create:
+            %% создавать на каждом transient-fail'е чревато гонкой и dup-doc'ами.
+            lager:warning("ensure_user_doc: open_doc failed owner_id=~p err=~p",
+                          [OwnerId, OpenErr]),
+            {'error', 'datastore_unreachable'}
+    end.
+
+%% @doc Маппинг внутренней причины отказа в crossbar-ответ.
+%%
+%% Refresh-режим: любая проблема → `invalid_credentials' (401), чтобы
+%% mobile-клиент свалился в полный AppAuth-flow (контракт handle_refresh).
+%%
+%% Login-режим:
+%%   `{validation_errors,_}'  — канонический Kazoo per-field error через
+%%                              `add_doc_validation_errors/2' (структурный
+%%                              ответ; фронту понятно, какой именно атрибут
+%%                              отсутствует — обычно `last_name' у юзера с
+%%                              пустым `sn' в AD).
+%%   `{system_error,Error}'   — `add_system_error(Error,_)' (как в cb_users).
+%%   `'datastore_unreachable'' — 503, чтобы клиент ретраил.
+%%   Иное (catch-all, `EXIT')  — `unspecified_fault' (500), чтобы оператор не
+%%                              путал инфра-проблему с проблемой AD-профиля.
+-spec reject_user_provisioning(cb_context:context()
+                              ,'login' | 'refresh'
+                              ,term()
+                              ) -> cb_context:context().
+reject_user_provisioning(Context, 'refresh', _Reason) ->
+    cb_context:add_system_error('invalid_credentials', Context);
+reject_user_provisioning(Context, 'login', {'validation_errors', Errors}) ->
+    cb_context:add_doc_validation_errors(Context, Errors);
+reject_user_provisioning(Context, 'login', {'system_error', Error}) ->
+    cb_context:add_system_error(Error, Context);
+reject_user_provisioning(Context, 'login', 'datastore_unreachable') ->
+    cb_context:add_system_error('datastore_unreachable', Context);
+reject_user_provisioning(Context, 'login', _Reason) ->
+    cb_context:add_system_error('unspecified_fault', Context).
+
+%% @doc Выпуск Kazoo auth-token'а + обогащение KC-токенами.
+-spec issue_auth_token(cb_context:context()
+                      ,kz_term:ne_binary()
+                      ,kz_term:ne_binary()
+                      ,kz_term:ne_binary()
+                      ,map()
+                      ,kz_term:ne_binary()
+                      ,kz_term:ne_binary()
+                      ) -> cb_context:context().
+issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
+                 AccountId, OwnerId) ->
     UserInfoJObj = kz_json:from_map(UserInfoMap),
     lager:info("provide_keycloak_token/5  UserInfoJObj: ~p",[UserInfoJObj]),
     AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
