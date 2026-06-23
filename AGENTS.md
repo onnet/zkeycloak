@@ -40,3 +40,10 @@
 `mvn clean package` → `scp brt-authenticator.jar` → `/opt/keycloak/providers/` → `kc.sh build` → `systemctl restart keycloak`
 
 **Сервер:** `keycloak.brterminal.ru` (10.110.20.50), realm `BRT`, клиент `onbill_client`
+
+## Накопленная память (вынесено из глобального MEMORY.md 2026-06-23)
+
+Доменные факты zkeycloak, ранее жившие в always-loaded `MEMORY.md` — перенесены сюда (грузятся только при работе в этом поддереве). Полная детализация — в одноимённых файлах каталога памяти (`~/.claude/projects/-home-iam-Development/memory/<file>.md`).
+
+- **mobile PKCE**: `cb_zkeycloak_ext` берёт `code_verifier` из query-string; web без PKCE, mobile обязан. (`zkeycloak_mobile_pkce.md`)
+- **JWT-claims отбрасываются**: `provide_keycloak_token` берёт 5 полей; `ldap_uuid` теряется без patch. (`zkeycloak_jwt_claims_lost.md`)
