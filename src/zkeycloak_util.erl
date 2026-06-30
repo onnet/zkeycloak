@@ -6,6 +6,7 @@
         ,client_id/0
         ,client_secret/0
         ,redirect_uri/0
+        ,is_configured/0
         ,preferred_auth_methods/0
         ,retrieve_token/1
         ,retrieve_token/2
@@ -39,9 +40,11 @@
          ,{<<"pvt_type">>, kzd_users:type()}
          ]}).
 
+-define(ISSUER_UNSET, <<"issuer">>).
+
 -spec issuer() -> kz_term:ne_binary().
 issuer() ->
-    kapps_config:get_ne_binary(<<"zkeycloak">>, <<"issuer">>, <<"issuer">>).
+    kapps_config:get_ne_binary(<<"zkeycloak">>, <<"issuer">>, ?ISSUER_UNSET).
 
 -spec client_id_atom() -> atom().
 client_id_atom() ->
@@ -58,6 +61,21 @@ client_secret() ->
 -spec redirect_uri() -> kz_term:ne_binary().
 redirect_uri() ->
     kapps_config:get_ne_binary(<<"zkeycloak">>, <<"redirect_uri">>, <<"redirect_uri">>).
+
+%% @doc Настроен ли KC на этой ноде: `issuer' задан (не дефолт-плейсхолдер)
+%% и похож на http(s)-URL. Используется, чтобы (а) не поднимать oidcc
+%% discovery-воркер вхолостую и (б) короткозамкнуть валидацию KC-токенов.
+-spec is_configured() -> boolean().
+is_configured() ->
+    case issuer() of
+        ?ISSUER_UNSET -> 'false';
+        Issuer -> is_http_url(Issuer)
+    end.
+
+-spec is_http_url(kz_term:ne_binary()) -> boolean().
+is_http_url(<<"http://", _/binary>>) -> 'true';
+is_http_url(<<"https://", _/binary>>) -> 'true';
+is_http_url(_) -> 'false'.
 
 -spec preferred_auth_methods() -> kz_term:ne_binary().
 preferred_auth_methods() ->
@@ -355,7 +373,23 @@ jwt_iss(Token) ->
 
 -spec maybe_keycloak_token(kz_term:ne_binary()) -> boolean().
 maybe_keycloak_token(Token) ->
-    jwt_iss(Token) == issuer().
+    is_configured()
+        andalso is_jwt_shaped(Token)
+        andalso jwt_iss(Token) == issuer().
+
+%% @doc Дешёвый предчек: JWT = `header.payload.sig' (минимум две точки).
+%% Opaque Kazoo db-токены (UUID) точек не содержат → пропускаем дорогой
+%% base64-decode для не-JWT и защищаемся от случайного совпадения с
+%% дефолт-`issuer'.
+-spec is_jwt_shaped(any()) -> boolean().
+is_jwt_shaped(Token) when is_binary(Token) ->
+    case binary:matches(Token, <<".">>) of
+        [_, _ | _] -> 'true';
+        _ -> 'false'
+    end;
+is_jwt_shaped(_) ->
+    %% не-binary токен (напр. map db-токена) — точно не KC-JWT; без краша
+    'false'.
 
 -spec maybe_keycloak_token_validate(kz_term:ne_binary(), kz_term:proplist()) ->
           {'ok', 'not_keycloack_token' | 'onbill_access_provided'} |
