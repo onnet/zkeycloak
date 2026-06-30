@@ -150,7 +150,6 @@ validate(Context, ?AUTH_CALLBACK) ->
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
-    lager:info("validate_ext/2  cb_context:query_string: ~p",[cb_context:query_string(Context)]),
     QS = cb_context:query_string(Context),
     Code = kz_json:get_ne_binary_value(<<"code">>, QS),
     %% Если клиент прислал свой redirect_uri (mobile-flow с deep-link'ом)
@@ -164,6 +163,11 @@ validate(Context, ?AUTH_CALLBACK) ->
     %% требует исходный verifier в /token. Web-flow zfront пока без
     %% PKCE — передаёт 'undefined', oidcc не добавит pkce_verifier в /token.
     PkceVerifier = kz_json:get_ne_binary_value(<<"code_verifier">>, QS),
+    %% issue 01: сырой QS = authorization `code' + PKCE `code_verifier' в логах
+    %% (одноразовый, но чувствительный матерьял). Логируем только ФАКТ callback'а
+    %% и НАЛИЧИЕ полей (boolean), без значений. redirect_uri не секрет.
+    lager:info("validate_ext/2  auth_callback: has_code=~p has_code_verifier=~p redirect_uri=~s"
+              ,[Code =/= 'undefined', PkceVerifier =/= 'undefined', RedirectUri]),
     case zkeycloak_util:retrieve_token(Code, RedirectUri, PkceVerifier) of
         {oidcc_token
         ,{oidcc_token_id, TokenId, ClaimsMap}
@@ -172,9 +176,11 @@ validate(Context, ?AUTH_CALLBACK) ->
         ,_Scope
         } = TokenTuple ->
 
-            lager:info("validate_ext/2  TokenId: ~p",[TokenId]),
-            lager:info("validate_ext/2  TokenAccess: ~p",[TokenAccess]),
-            lager:info("validate_ext/2  TokenRefresh: ~p",[TokenRefresh]),
+            %% issue 01: id/access/refresh — живые bearer-креды (refresh ~30 дней).
+            %% Маскируем значения (префикс+длина); сам lager:info сохранён.
+            lager:info("validate_ext/2  TokenId: ~s",[zkeycloak_util:redact(TokenId)]),
+            lager:info("validate_ext/2  TokenAccess: ~s",[zkeycloak_util:redact(TokenAccess)]),
+            lager:info("validate_ext/2  TokenRefresh: ~s",[zkeycloak_util:redact(TokenRefresh)]),
             lager:info("validate_ext/2  ClaimsMap: ~p",[ClaimsMap]),
             lager:info("validate_ext/2  _Scope: ~p",[_Scope]),
 
@@ -214,10 +220,12 @@ validate(Context, ?LOGOUT) ->
     QS = cb_context:query_string(Context),
     IdTokenHint = kz_json:get_ne_binary_value(<<"id_token_hint">>, QS),
     LogoutUrl = zkeycloak_util:logout_url(IdTokenHint),
-    lager:info("zkeycloak logout_url (id_token_hint=~s): ~s"
-              ,[case IdTokenHint of 'undefined' -> <<"no">>; _ -> <<"yes">> end
-               ,LogoutUrl
-               ]),
+    %% issue 01: LogoutUrl несёт `id_token_hint=<сырой id_token>' в query —
+    %% полный URL в лог писать нельзя. Логируем redacted-hint (он же сигналит
+    %% наличие/отсутствие hint'а: `undefined' = no); endpoint восстановим из
+    %% конфига. Сам lager:info сохранён.
+    lager:info("zkeycloak logout_url: id_token_hint=~s"
+              ,[zkeycloak_util:redact(IdTokenHint)]),
     JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 %% @doc Обмен refresh_token → новый Kazoo auth_token + новый KC refresh/id.
@@ -276,8 +284,9 @@ handle_refresh(Context, RefreshToken) ->
                ,{oidcc_token_refresh, NewTokenRefresh}
                ,_Scope
                } = TokenTuple} ->
+            %% issue 01: маскируем новые токены (ротированный refresh валиден ~30 дней).
             lager:info("handle_refresh: ok, new_access=~s new_refresh=~s",
-                       [NewTokenAccess, NewTokenRefresh]),
+                       [zkeycloak_util:redact(NewTokenAccess), zkeycloak_util:redact(NewTokenRefresh)]),
             UserInfoMap = zkeycloak_util:retrieve_userinfo(TokenTuple),
             UserInfoRoles = kz_maps:get([<<"resource_access">>
                                         ,<<"onbill_client">>

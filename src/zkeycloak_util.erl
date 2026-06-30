@@ -26,6 +26,7 @@
         ,auth_method/1
         ,logout_url/0
         ,logout_url/1
+        ,redact/1
         ]
        ).
 
@@ -256,7 +257,10 @@ refresh_token(RefreshToken) ->
              ,client_secret()
              ,Opts
              ),
-        lager:info("zkeycloak refresh_token oidcc result: ~p", [Result]),
+        %% Result содержит новый набор живых токенов (access/refresh/id) —
+        %% сырой `~p' = 30-дневный replay при утечке логов (issue 01 KC-auth).
+        %% Логируем санитизированную структуру: префикс+длина вместо токенов.
+        lager:info("zkeycloak refresh_token oidcc result: ~s", [redact_token_result(Result)]),
         case Result of
             {'ok', _} -> Result;
             {'error', _} -> Result;
@@ -268,6 +272,38 @@ refresh_token(RefreshToken) ->
                           [Class, Reason, Stack]),
             {'error', {Class, Reason}}
     end.
+
+%% @doc Маскирование bearer-кред (access/refresh/id token, code_verifier,
+%% authorization code) для лога. Печатаем только короткий префикс + длину —
+%% этого достаточно для корреляции лог-строк, но НЕ для реплея валидной
+%% сессии. Сырой токен в логах = 30-дневный replay при утечке лог-архива
+%% (issue 01 кросс-слойного KC-auth ревью). `lager'-вызов сохраняем —
+%% редактируем только ЗНАЧЕНИЕ (правило проекта: не вырезать lager).
+-spec redact(kz_term:api_binary()) -> kz_term:ne_binary().
+redact('undefined') -> <<"undefined">>;
+redact(<<>>) -> <<"empty">>;
+redact(Value) when is_binary(Value) ->
+    Len = byte_size(Value),
+    Prefix = binary:part(Value, 0, min(6, Len)),
+    <<Prefix/binary, "..(len=", (integer_to_binary(Len))/binary, ")">>;
+redact(Value) ->
+    redact(kz_term:to_binary(Value)).
+
+%% @doc Санитайзер oidcc-результата refresh для лога: сохраняем структуру
+%% (ok/error + наличие полей), но маскируем сами токены. Catch-all делает
+%% хелпер fail-safe — на неожиданной форме просто печатает её как есть.
+-spec redact_token_result(any()) -> kz_term:ne_binary().
+redact_token_result({'ok', {'oidcc_token'
+                           ,{'oidcc_token_id', Id, _Claims}
+                           ,{'oidcc_token_access', Access, _Timeout, _Type}
+                           ,{'oidcc_token_refresh', Refresh}
+                           ,_Scope
+                           }}) ->
+    <<"{ok,oidcc_token id=", (redact(Id))/binary
+     ," access=", (redact(Access))/binary
+     ," refresh=", (redact(Refresh))/binary, "}">>;
+redact_token_result(Other) ->
+    kz_term:to_binary(io_lib:format("~p", [Other])).
 
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
