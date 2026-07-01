@@ -209,9 +209,21 @@ validate(Context, ?KERBEROS_LOGIN) ->
         'true' ->
             QS = cb_context:query_string(Context),
             Prompt = kz_json:get_ne_binary_value(<<"prompt">>, QS),
-            ExtraOpts = case Prompt of
+            PromptOpts = case Prompt of
                 <<"none">> -> #{'prompt' => <<"none">>};
                 _ -> #{}
+            end,
+            %% PKCE code_challenge (S256) — опционален, симметрично
+            %% ?AUTH_LINK (Fable-review issue 04): web-фронт теперь шлёт
+            %% challenge и для Kerberos-flow (verifier придержит в
+            %% sessionStorage до auth_callback). challenge публичен по
+            %% дизайну PKCE. 'undefined' → старый фронт без PKCE.
+            CodeChallenge = kz_json:get_ne_binary_value(<<"code_challenge">>, QS),
+            lager:info("validate_ext/2 kerberos_login: has_code_challenge=~p",
+                       [CodeChallenge =/= 'undefined']),
+            ExtraOpts = case CodeChallenge of
+                'undefined' -> PromptOpts;
+                _ -> PromptOpts#{'code_challenge' => CodeChallenge}
             end,
             AuthUrl = zkeycloak_util:kerberos_auth_url(ExtraOpts),
             JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),

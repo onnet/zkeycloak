@@ -153,8 +153,20 @@ kerberos_auth_url(ExtraOpts) ->
         'undefined' -> [];
         Prompt -> [{<<"prompt">>, Prompt}]
     end,
-    lager:info("zkeycloak kerberos_auth_url: issuer=~s client_id=~s redirect_uri=~s",
-               [issuer(), client_id(), redirect_uri()]),
+    %% PKCE и для Kerberos-flow (Fable-review issue 04): callback-обмен у
+    %% web-клиента прикладывает verifier из sessionStorage к любому code —
+    %% code, выданный /authorize БЕЗ challenge, KC отверг бы (invalid_grant).
+    %% Заодно Kerberos-code получает ту же защиту от code-injection.
+    %% 'undefined' → без PKCE (обратная совместимость со старым фронтом).
+    PkceExtension = case maps:get('code_challenge', ExtraOpts, 'undefined') of
+        'undefined' -> [];
+        CodeChallenge -> [{<<"code_challenge">>, CodeChallenge}
+                         ,{<<"code_challenge_method">>, <<"S256">>}
+                         ]
+    end,
+    lager:info("zkeycloak kerberos_auth_url: issuer=~s client_id=~s redirect_uri=~s pkce=~s",
+               [issuer(), client_id(), redirect_uri(),
+                case PkceExtension of [] -> <<"no">>; _ -> <<"yes">> end]),
     Result =
         oidcc:create_redirect_url(
           client_id_atom()
@@ -162,7 +174,7 @@ kerberos_auth_url(ExtraOpts) ->
          ,client_secret()
          ,#{'redirect_uri' => redirect_uri()
            ,'preferred_auth_methods' => preferred_auth_methods()
-           ,'url_extension' => BaseExtension ++ PromptExtension
+           ,'url_extension' => BaseExtension ++ PromptExtension ++ PkceExtension
            }
          ),
     lager:info("zkeycloak kerberos_auth_url oidcc result: ~p", [Result]),
