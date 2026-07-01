@@ -45,5 +45,5 @@
 
 Доменные факты zkeycloak, ранее жившие в always-loaded `MEMORY.md` — перенесены сюда (грузятся только при работе в этом поддереве). Полная детализация — в одноимённых файлах каталога памяти (`~/.claude/projects/-home-iam-Development/memory/<file>.md`).
 
-- **mobile PKCE**: `cb_zkeycloak_ext` берёт `code_verifier` из query-string; web без PKCE, mobile обязан. (`zkeycloak_mobile_pkce.md`)
+- **mobile+web PKCE**: `cb_zkeycloak_ext` берёт `code_verifier` из query-string; mobile (AppAuth) с 2026-05, web (zfront) с 2026-07 (issue 04). Остаточный риск: KC-клиент должен требовать PKCE=S256 для полного закрытия. (`zkeycloak_mobile_pkce.md`)
 - **JWT-claims отбрасываются**: `provide_keycloak_token` берёт 5 полей; `ldap_uuid` теряется без patch. (`zkeycloak_jwt_claims_lost.md`)
