@@ -1,6 +1,7 @@
 -module(zkeycloak_util).
 
 -export([auth_url/0
+        ,auth_url/1
         ,issuer/0
         ,client_id_atom/0
         ,client_id/0
@@ -88,22 +89,50 @@ preferred_auth_methods() ->
 
 -spec auth_url() -> kz_term:ne_binary().
 auth_url() ->
-    lager:info("zkeycloak auth_url: issuer=~s client_id=~s redirect_uri=~s",
-               [issuer(), client_id(), redirect_uri()]),
+    auth_url('undefined').
+
+%% @doc Auth URL с опциональным PKCE `code_challenge' (S256) для web-flow
+%% (issue 04 KC-auth ревью — authorization-code-injection). Web-клиент
+%% (zfront) генерирует `code_verifier'+`code_challenge' на своей стороне,
+%% кладёт verifier в sessionStorage и присылает СЮДА только challenge. Мы
+%% прокидываем `code_challenge'+`code_challenge_method=S256' в /authorize
+%% через `url_extension' — тем же механизмом, что `kerberos_auth_url/1'
+%% добавляет `kc_idp_hint'. oidcc сам PKCE не считает (для этого ему нужен
+%% verifier, которого у бэкенда нет), поэтому raw-параметры через
+%% url_extension — единственный корректный путь. Verifier участвует уже в
+%% /token обмене (`retrieve_token/3'), который PKCE-плумбинг уже умеет.
+%% `CodeChallenge='undefined'' → web-без-PKCE (обратная совместимость).
+-spec auth_url(kz_term:api_ne_binary()) -> kz_term:ne_binary().
+auth_url(CodeChallenge) ->
+    lager:info("zkeycloak auth_url: issuer=~s client_id=~s redirect_uri=~s pkce=~s",
+               [issuer(), client_id(), redirect_uri(),
+                case CodeChallenge of 'undefined' -> <<"no">>; _ -> <<"yes">> end]),
     Result =
         oidcc:create_redirect_url(
           client_id_atom()
          ,client_id()
          ,client_secret()
-         ,#{'redirect_uri' => redirect_uri()
-           ,'preferred_auth_methods' => preferred_auth_methods()
-           }
+         ,auth_url_opts(CodeChallenge)
          ),
     lager:info("zkeycloak auth_url oidcc result: ~p", [Result]),
     {ok, RedirectUri} = Result,
     Url = kz_binary:join(RedirectUri, <<"">>),
     lager:info("zkeycloak auth_url final: ~s", [Url]),
     Url.
+
+%% @doc Opts для `oidcc:create_redirect_url' — с PKCE-challenge (S256) или без.
+-spec auth_url_opts(kz_term:api_ne_binary()) -> map().
+auth_url_opts('undefined') ->
+    #{'redirect_uri' => redirect_uri()
+     ,'preferred_auth_methods' => preferred_auth_methods()
+     };
+auth_url_opts(CodeChallenge) ->
+    #{'redirect_uri' => redirect_uri()
+     ,'preferred_auth_methods' => preferred_auth_methods()
+     ,'url_extension' => [{<<"code_challenge">>, CodeChallenge}
+                         ,{<<"code_challenge_method">>, <<"S256">>}
+                         ]
+     }.
 
 -spec kerberos_enabled() -> boolean().
 kerberos_enabled() ->

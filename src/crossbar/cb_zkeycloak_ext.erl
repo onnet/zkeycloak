@@ -141,7 +141,15 @@ validate(Context, ?AUTH_LINK) ->
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
-    AuthUrl = zkeycloak_util:auth_url(),
+    %% PKCE code_challenge (S256) — опционален (issue 04). Web-flow zfront
+    %% генерирует пару на своей стороне и присылает СЮДА только challenge;
+    %% verifier он придержит в sessionStorage до /token обмена
+    %% (auth_callback). Mobile (AppAuth) свой challenge шлёт в /authorize
+    %% сам, эту ручку не зовёт. 'undefined' → web-без-PKCE (совместимость).
+    QS = cb_context:query_string(Context),
+    CodeChallenge = kz_json:get_ne_binary_value(<<"code_challenge">>, QS),
+    lager:info("validate_ext/2  auth_link: has_code_challenge=~p", [CodeChallenge =/= 'undefined']),
+    AuthUrl = zkeycloak_util:auth_url(CodeChallenge),
     JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 validate(Context, ?AUTH_CALLBACK) ->
