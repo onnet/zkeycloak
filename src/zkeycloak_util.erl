@@ -482,10 +482,16 @@ jwt_iss(Token) ->
         {'error', _Reason} -> 'undefined'
     end.
 
+%% @doc Токен выпущен НАШИМ KC: JWT-shaped и `iss' совпал со
+%% сконфигурированным issuer. Намеренно НЕ короткозамыкается по
+%% `is_configured()': классификация «чей токен» не должна зависеть от
+%% готовности интеграции — иначе полунастроенная нода трактовала бы
+%% KC-токен как «не-KC» и пропускала его в общий `kz_auth' мимо
+%% роль-гейта `onbill_access' (fail-open; Fable-review issue 12).
+%% Дефолт-сентинел `?ISSUER_UNSET' с реальным `iss' (URL) не совпадёт.
 -spec maybe_keycloak_token(kz_term:ne_binary()) -> boolean().
 maybe_keycloak_token(Token) ->
-    is_configured()
-        andalso is_jwt_shaped(Token)
+    is_jwt_shaped(Token)
         andalso jwt_iss(Token) == issuer().
 
 %% @doc Дешёвый предчек: JWT = `header.payload.sig' (минимум две точки).
@@ -510,7 +516,17 @@ maybe_keycloak_token_validate(Token, _Options) ->
         'false' ->
             {'ok', 'not_keycloack_token'};
         'true' ->
-            validate_onbill_access(Token)
+            case is_configured() of
+                'true' -> validate_onbill_access(Token);
+                'false' ->
+                    %% fail-closed: токен нашего issuer'а, но интеграция не
+                    %% считается сконфигурированной — отвергаем, а не
+                    %% пропускаем в kz_auth (там KC-issuer может быть
+                    %% доверенным провайдером auth-DB, и роль-гейт
+                    %% `onbill_access' обходился бы). Fable-review issue 12.
+                    lager:warning("keycloak-issued token while zkeycloak is not configured, rejecting"),
+                    {'error', 'keycloak_not_configured'}
+            end
     end.
 
 -spec validate_onbill_access(kz_term:ne_binary()) ->
