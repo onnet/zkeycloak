@@ -177,12 +177,12 @@ validate(Context, ?AUTH_CALLBACK) ->
     lager:info("validate_ext/2  auth_callback: has_code=~p has_code_verifier=~p redirect_uri=~s"
               ,[Code =/= 'undefined', PkceVerifier =/= 'undefined', RedirectUri]),
     case zkeycloak_util:retrieve_token(Code, RedirectUri, PkceVerifier) of
-        {oidcc_token
-        ,{oidcc_token_id, TokenId, ClaimsMap}
-        ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
-        ,{oidcc_token_refresh, TokenRefresh}
-        ,_Scope
-        } = TokenTuple ->
+        {'ok', {oidcc_token
+               ,{oidcc_token_id, TokenId, ClaimsMap}
+               ,{oidcc_token_access, TokenAccess, _Timeout, _Type}
+               ,{oidcc_token_refresh, TokenRefresh}
+               ,_Scope
+               } = TokenTuple} ->
 
             %% issue 01: id/access/refresh — живые bearer-креды (refresh ~30 дней).
             %% Маскируем значения (префикс+длина); сам lager:info сохранён.
@@ -191,18 +191,16 @@ validate(Context, ?AUTH_CALLBACK) ->
             lager:info("validate_ext/2  TokenRefresh: ~s",[zkeycloak_util:redact(TokenRefresh)]),
             lager:info("validate_ext/2  ClaimsMap: ~p",[ClaimsMap]),
             lager:info("validate_ext/2  _Scope: ~p",[_Scope]),
-
-            UserInfoMap = zkeycloak_util:retrieve_userinfo(TokenTuple),
-            lager:info("validate_ext/2  UserInfoMap: ~p",[UserInfoMap]),
-            UserInfoRoles = kz_maps:get([<<"resource_access">>,<<"onbill_client">>,<<"roles">>], UserInfoMap, []),
-            case lists:member(<<"onbill_access">>, UserInfoRoles) of
-                'true' ->
-                    provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, 'login');
-                'false' ->
-                    lager:info("validate_ext/2  insufficient UserInfoRoles: ~p",[UserInfoRoles]),
-                    cb_context:add_system_error('insufficient_role', Context)
-            end;
-        _ ->
+            authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, 'login');
+        %% issue 05: `retrieve_token/3' нормализован к {ok,_}|{error,_}. Битый/
+        %% просроченный/уже-использованный `code' (invalid_grant, в т.ч. от гонки
+        %% cancel→retry на MIUI — issue 06) или KC-недоступность → чистый 401
+        %% `invalid_credentials' вместо прежнего badmatch-500.
+        {'error', Reason} ->
+            lager:info("validate_ext/2  auth_callback: token exchange failed ~p", [Reason]),
+            cb_context:add_system_error('invalid_credentials', Context);
+        Other ->
+            lager:info("validate_ext/2  auth_callback: unexpected token result ~p", [Other]),
             cb_context:add_system_error('invalid_credentials', Context)
     end;
 validate(Context, ?KERBEROS_LOGIN) ->
@@ -295,23 +293,47 @@ handle_refresh(Context, RefreshToken) ->
             %% issue 01: маскируем новые токены (ротированный refresh валиден ~30 дней).
             lager:info("handle_refresh: ok, new_access=~s new_refresh=~s",
                        [zkeycloak_util:redact(NewTokenAccess), zkeycloak_util:redact(NewTokenRefresh)]),
-            UserInfoMap = zkeycloak_util:retrieve_userinfo(TokenTuple),
-            UserInfoRoles = kz_maps:get([<<"resource_access">>
-                                        ,<<"onbill_client">>
-                                        ,<<"roles">>], UserInfoMap, []),
-            case lists:member(<<"onbill_access">>, UserInfoRoles) of
-                'true' ->
-                    provide_keycloak_token(Context, NewTokenAccess, NewTokenId,
-                                           NewTokenRefresh, UserInfoMap, 'refresh');
-                'false' ->
-                    lager:info("handle_refresh: insufficient roles ~p", [UserInfoRoles]),
-                    cb_context:add_system_error('insufficient_role', Context)
-            end;
+            authorize_and_issue(Context, TokenTuple, NewTokenAccess, NewTokenId,
+                                NewTokenRefresh, 'refresh');
         {'error', Reason} ->
             lager:info("handle_refresh: KC error ~p — invalid_grant flow", [Reason]),
             cb_context:add_system_error('invalid_credentials', Context);
         Other ->
             lager:info("handle_refresh: unexpected oidcc result ~p", [Other]),
+            cb_context:add_system_error('invalid_credentials', Context)
+    end.
+
+%% @doc Общий хвост login- и refresh-путей после успешного получения набора
+%% KC-токенов: тянем userinfo, гейтим по клиентской роли `onbill_access',
+%% выдаём Kazoo-токен либо мапим отказ. `retrieve_userinfo/1' нормализован
+%% (issue 05) к {ok,_}|{error,_} — сбой userinfo (сетевой к KC) даёт чистый
+%% 401 `invalid_credentials' вместо badmatch-500. Ранее эта ветка (userinfo +
+%% role-gate) дублировалась дословно в auth_callback'е и handle_refresh.
+-spec authorize_and_issue(cb_context:context()
+                         ,tuple()
+                         ,kz_term:ne_binary()
+                         ,kz_term:ne_binary()
+                         ,kz_term:ne_binary()
+                         ,'login' | 'refresh'
+                         ) -> cb_context:context().
+authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mode) ->
+    case zkeycloak_util:retrieve_userinfo(TokenTuple) of
+        {'ok', UserInfoMap} ->
+            lager:info("authorize_and_issue[~p]  UserInfoMap: ~p", [Mode, UserInfoMap]),
+            UserInfoRoles = kz_maps:get([<<"resource_access">>
+                                        ,<<"onbill_client">>
+                                        ,<<"roles">>], UserInfoMap, []),
+            case lists:member(<<"onbill_access">>, UserInfoRoles) of
+                'true' ->
+                    provide_keycloak_token(Context, TokenAccess, TokenId,
+                                           TokenRefresh, UserInfoMap, Mode);
+                'false' ->
+                    lager:info("authorize_and_issue[~p]  insufficient UserInfoRoles: ~p",
+                               [Mode, UserInfoRoles]),
+                    cb_context:add_system_error('insufficient_role', Context)
+            end;
+        {'error', Reason} ->
+            lager:info("authorize_and_issue[~p]  retrieve_userinfo failed ~p", [Mode, Reason]),
             cb_context:add_system_error('invalid_credentials', Context)
     end.
 

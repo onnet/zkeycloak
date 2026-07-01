@@ -171,7 +171,8 @@ kerberos_auth_url(ExtraOpts) ->
     lager:info("zkeycloak kerberos_auth_url final: ~s", [Url]),
     Url.
 
--spec retrieve_token(kz_term:ne_binary()) -> any().
+-spec retrieve_token(kz_term:ne_binary()) ->
+          {'ok', tuple()} | {'error', any()}.
 retrieve_token(AuthCode) ->
     retrieve_token(AuthCode, redirect_uri()).
 
@@ -181,7 +182,8 @@ retrieve_token(AuthCode) ->
 %% совпадения redirect_uri в /authorize и /token. Web (zfront) шлёт
 %% свой redirect_uri в QS либо вызывает retrieve_token/1 (default
 %% config) — обратная совместимость сохранена.
--spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary()) -> any().
+-spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          {'ok', tuple()} | {'error', any()}.
 retrieve_token(AuthCode, RedirectUri) ->
     retrieve_token(AuthCode, RedirectUri, 'undefined').
 
@@ -192,7 +194,8 @@ retrieve_token(AuthCode, RedirectUri) ->
 %% иначе KC отвечает 'invalid_grant: PKCE code verifier not specified'.
 %% Web-flow без PKCE передаёт PkceVerifier='undefined' — opts без
 %% pkce_verifier, oidcc не добавит его в /token request.
--spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary(), kz_term:api_ne_binary()) -> any().
+-spec retrieve_token(kz_term:ne_binary(), kz_term:ne_binary(), kz_term:api_ne_binary()) ->
+          {'ok', tuple()} | {'error', any()}.
 retrieve_token(AuthCode, RedirectUri, PkceVerifier) ->
     lager:info("zkeycloak retrieve_token redirect_uri: ~s pkce: ~s",
                [RedirectUri, case PkceVerifier of 'undefined' -> <<"no">>; _ -> <<"yes">> end]),
@@ -203,39 +206,82 @@ retrieve_token(AuthCode, RedirectUri, PkceVerifier) ->
                'undefined' -> BaseOpts;
                _ -> BaseOpts#{'pkce_verifier' => PkceVerifier}
            end,
-    {ok, Token} =
-        oidcc:retrieve_token(
-          AuthCode
-         ,client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,Opts
-         ),
-    Token.
+    %% `oidcc:retrieve_token/5' по спеке отдаёт `{ok, oidcc_token:t()}' на
+    %% успехе, но на ошибке KC (invalid_grant: битый/просроченный/уже-
+    %% использованный `code', PKCE-mismatch, KC недоступен) ЛИБО возвращает
+    %% `{error,_}', ЛИБО выбрасывает исключение (парсинг JWT / http / JWKS —
+    %% ровно как в `refresh_token/1'). Заворачиваем в try-catch и нормализуем
+    %% к единому `{ok,_} | {error,_}' контракту — иначе жёсткий матч
+    %% `{ok,Token} = ...' давал badmatch, и callback
+    %% `cb_zkeycloak_ext:validate(?AUTH_CALLBACK)' отвечал Crossbar-500 вместо
+    %% чистого 401 `invalid_credentials' (issue 05 кросс-слойного KC-auth ревью).
+    normalize_oidcc(<<"retrieve_token">>,
+                    fun() ->
+                            oidcc:retrieve_token(
+                              AuthCode
+                             ,client_id_atom()
+                             ,client_id()
+                             ,client_secret()
+                             ,Opts
+                             )
+                    end).
 
--spec retrieve_userinfo(kz_term:ne_binary()) -> any().
+-spec retrieve_userinfo(tuple() | kz_term:ne_binary()) ->
+          {'ok', map()} | {'error', any()}.
 retrieve_userinfo(Token) ->
-    {ok, Claims} =
-        oidcc:retrieve_userinfo(
-          Token
-         ,client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,#{}
-         ),
-    Claims.
+    %% Та же нормализация, что и `retrieve_token/3' (issue 05): userinfo
+    %% зовётся уже после успешного обмена, но всё равно может дать `{error,_}'
+    %% / исключение (сетевой сбой к KC) — не роняем Crossbar в 500.
+    normalize_oidcc(<<"retrieve_userinfo">>,
+                    fun() ->
+                            oidcc:retrieve_userinfo(
+                              Token
+                             ,client_id_atom()
+                             ,client_id()
+                             ,client_secret()
+                             ,#{}
+                             )
+                    end).
 
--spec introspect_token(kz_term:ne_binary()) -> any().
+-spec introspect_token(tuple() | kz_term:ne_binary()) ->
+          {'ok', tuple()} | {'error', any()}.
 introspect_token(Token) ->
-    {ok, Introspection} =
-        oidcc:introspect_token(
-          Token
-         ,client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,#{}
-         ),
-    Introspection.
+    %% Нормализация под общий контракт (issue 05). Вызывающих сейчас нет, но
+    %% держим арность в едином fail-safe виде с остальными oidcc-обёртками.
+    normalize_oidcc(<<"introspect_token">>,
+                    fun() ->
+                            oidcc:introspect_token(
+                              Token
+                             ,client_id_atom()
+                             ,client_id()
+                             ,client_secret()
+                             ,#{}
+                             )
+                    end).
+
+%% @doc Общий нормализатор результата oidcc-вызова к `{ok,_} | {error,_}'.
+%% oidcc 3.x на сбое ЛИБО возвращает `{error,_}', ЛИБО бросает исключение
+%% (зависит от этапа: парсинг JWT / http-ответ KC / JWKS-валидация). Ловим
+%% оба и сводим к единому контракту, чтобы Crossbar-callback'и не падали в
+%% badmatch-500 (issue 05). `Tag' — имя вызова для лога. Сам `~p'-результат
+%% НЕ логируем на успехе: там живые bearer-токены (issue 01).
+-spec normalize_oidcc(kz_term:ne_binary(), fun(() -> any())) ->
+          {'ok', any()} | {'error', any()}.
+normalize_oidcc(Tag, Fun) ->
+    try Fun() of
+        {'ok', _} = Ok -> Ok;
+        {'error', _} = Err ->
+            lager:info("zkeycloak ~s oidcc error: ~p", [Tag, Err]),
+            Err;
+        Other ->
+            lager:warning("zkeycloak ~s unexpected oidcc result: ~p", [Tag, Other]),
+            {'error', {'unexpected_oidcc_result', Other}}
+    catch
+        Class:Reason:Stack ->
+            lager:warning("zkeycloak ~s exception ~p:~p stack=~p",
+                          [Tag, Class, Reason, Stack]),
+            {'error', {Class, Reason}}
+    end.
 
 %% @doc Обмен refresh_token → новый набор токенов (access + refresh + id_token).
 %% Зfield (mobile) хранит refresh_token в secure_storage под BiometricPrompt и
