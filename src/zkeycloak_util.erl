@@ -28,8 +28,21 @@
         ,logout_url/0
         ,logout_url/1
         ,redact/1
+        ,redact_headers/1
         ]
        ).
+
+%% @doc HTTP-заголовки, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми: несут
+%% живой Bearer-токен (`authorization'), Kazoo auth-token (`x-auth-token'),
+%% session-cookie или proxy-креды. Имена сравниваем в нижнем регистре
+%% (cowboy уже отдаёт lower-case, но нормализуем для устойчивости к
+%% proplist-форме). См. `redact_headers/1' (issue 14 KC-auth ревью).
+-define(SENSITIVE_HEADERS, [<<"authorization">>
+                           ,<<"proxy-authorization">>
+                           ,<<"cookie">>
+                           ,<<"set-cookie">>
+                           ,<<"x-auth-token">>
+                           ]).
 
 -define(MK_USER,
         {[{<<"enabled">>, 'true'}
@@ -375,6 +388,46 @@ redact(Value) when is_binary(Value) ->
     <<Prefix/binary, "..(len=", (integer_to_binary(Len))/binary, ")">>;
 redact(Value) ->
     redact(kz_term:to_binary(Value)).
+
+%% @doc Санитизация HTTP-заголовков перед логированием: значения
+%% credential-заголовков (`authorization', `cookie', `x-auth-token' и пр.,
+%% см. `?SENSITIVE_HEADERS') несут живой Bearer-токен / Kazoo auth-token /
+%% session-cookie — сырой `~p'-дамп `cb_context:req_headers/1' в лог = утечка
+%% (issue 14 кросс-слойного KC-auth ревью; тот же класс, что issue 01 про
+%% токены). Маскируем ТОЛЬКО значения sensitive-заголовков через `redact/1'
+%% (префикс+длина), имена и прочие заголовки оставляем как есть — лог
+%% сохраняет диагностическую ценность. `lager'-вызовы НЕ удаляем: правило
+%% проекта — редактировать данные, не вырезать логи. Работает и с map
+%% (`cowboy:http_headers()' в этой версии Kazoo), и с proplist (историческая
+%% форма); неожиданную форму отдаём без изменений (fail-safe, лог не роняем).
+-spec redact_headers(map() | kz_term:proplist() | any()) ->
+          map() | kz_term:proplist() | any().
+redact_headers(Headers) when is_map(Headers) ->
+    maps:map(fun redact_header_kv/2, Headers);
+redact_headers(Headers) when is_list(Headers) ->
+    [{K, redact_header_kv(K, V)} || {K, V} <- Headers];
+redact_headers(Other) ->
+    Other.
+
+-spec redact_header_kv(term(), term()) -> term().
+redact_header_kv(Key, Value) ->
+    case is_sensitive_header(Key) of
+        'true' -> redact(Value);
+        'false' -> Value
+    end.
+
+%% @doc `Key' — имя заголовка (binary у cowboy, возможно atom/string в
+%% proplist-форме). Сравниваем в нижнем регистре: имена ASCII, поэтому
+%% `kz_term:to_lower_binary/1' не портит их (кириллицы в HTTP-именах нет),
+%% и результат используется только для membership-проверки — оригинальный
+%% ключ в выводе сохраняется как есть.
+-spec is_sensitive_header(term()) -> boolean().
+is_sensitive_header(Key) when is_binary(Key);
+                              is_atom(Key);
+                              is_list(Key) ->
+    lists:member(kz_term:to_lower_binary(Key), ?SENSITIVE_HEADERS);
+is_sensitive_header(_Key) ->
+    'false'.
 
 %% @doc Санитайзер oidcc-результата refresh для лога: сохраняем структуру
 %% (ok/error + наличие полей), но маскируем сами токены. Catch-all делает

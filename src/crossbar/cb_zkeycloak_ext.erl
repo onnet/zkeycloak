@@ -58,7 +58,7 @@ resource_exists(?ZKEYCLOAK) -> 'true'.
 authorize(Context) ->
     lager:info("authorisze/1  req_data: ~p",[cb_context:req_data(Context)]),
     lager:info("authorisze/1  req_files: ~p",[cb_context:req_files(Context)]),
-    lager:info("authorisze/1  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("authorisze/1  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("authorisze/1  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("authorisze/1  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("authorisze/1  req_id: ~p",[cb_context:req_id(Context)]),
@@ -69,7 +69,7 @@ authorize(Context, Token1) ->
     lager:info("authorisze/2 Token1: ~p",[Token1]),
     lager:info("authorisze/2 req_data: ~p",[cb_context:req_data(Context)]),
     lager:info("authorisze/2 req_files: ~p",[cb_context:req_files(Context)]),
-    lager:info("authorisze/2 req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("authorisze/2 req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("authorisze/2 req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("authorisze/2 req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("authorisze/2 req_id: ~p",[cb_context:req_id(Context)]),
@@ -110,7 +110,7 @@ authenticate(Context, Token1) ->
     authenticate_nouns(Context, cb_context:req_nouns(Context)).
 
 authenticate_nouns(Context, [{<<"zkeycloak_ext">>, []}]) ->
-    lager:info("authenticate_nouns/2  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("authenticate_nouns/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     'true';
 authenticate_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_link">>]}]) ->
     'true';
@@ -129,7 +129,7 @@ authenticate_nouns(_Context, _Nouns) ->
 -spec validate(cb_context:context()) -> cb_context:context().
 validate(Context) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
-    lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("validate_ext/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
@@ -137,7 +137,7 @@ validate(Context) ->
 
 -spec validate(cb_context:context(), path_token()) -> cb_context:context().
 validate(Context, ?AUTH_LINK) ->
-    lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("validate_ext/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
@@ -154,7 +154,7 @@ validate(Context, ?AUTH_LINK) ->
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 validate(Context, ?AUTH_CALLBACK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
-    lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("validate_ext/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
@@ -267,7 +267,7 @@ validate(Context, ?REFRESH) ->
     end;
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
-    lager:info("validate_ext/2  req_headers: ~p",[cb_context:req_headers(Context)]),
+    lager:info("validate_ext/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("validate_ext/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
