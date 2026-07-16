@@ -31,6 +31,7 @@
         ,redact_headers/1
         ,redact_req_data/1
         ,claims_digest/1
+        ,redact_provisioning_error/1
         ]
        ).
 
@@ -41,7 +42,9 @@
 -export([redact_pii/1
         ,redact_validation_errors/1
         ,redact_crash/1
+        ,redact_stack/1
         ,redact_token_result/1
+        ,jwt_sub_unverified/1
         ]).
 -endif.
 
@@ -413,8 +416,12 @@ normalize_oidcc(Tag, Fun) ->
             {'error', {'unexpected_oidcc_result', Other}}
     catch
         Class:Reason:Stack ->
+            %% issue 15 (review-loop): `Stack' печатался сырым, а обёрнутые
+            %% тут вызовы — `oidcc:retrieve_token(AuthCode, _, ClientId,
+            %% ClientSecret, _)' и пр., т.е. фрейм с аргументами несёт и
+            %% `code', и `client_secret()'. Печатаем M:F/A без args.
             lager:warning("zkeycloak ~s exception ~p:~p stack=~p",
-                          [Tag, Class, Reason, Stack]),
+                          [Tag, Class, Reason, redact_stack(Stack)]),
             {'error', {Class, Reason}}
     end.
 
@@ -478,8 +485,12 @@ refresh_token(RefreshToken) ->
         end
     catch
         Class:Reason:Stack ->
+            %% issue 15 (review-loop): тот же класс — во фрейме `oidcc:
+            %% refresh_token(RefreshToken, …, ClientSecret, …)' лежат живой
+            %% refresh и client_secret; `base64:decode/2' (BIF-badarg в
+            %% `jwt_sub_unverified/1') кладёт во фрейм payload-сегмент JWT.
             lager:warning("zkeycloak refresh_token exception ~p:~p stack=~p",
-                          [Class, Reason, Stack]),
+                          [Class, Reason, redact_stack(Stack)]),
             {'error', {Class, Reason}}
     end.
 
@@ -692,6 +703,23 @@ redact_token_result({'ok', _Unrecognized}) ->
 redact_token_result(Other) ->
     kz_term:to_binary(io_lib:format("~p", [Other])).
 
+%% @doc Санитайзер причины отказа в провижининге user-doc'а для лога.
+%% `create_user/7' редактирует СВОЮ лог-строку, но наверх отдаёт `Reason'
+%% сырым (клиенту нужен полный per-field error) — и вызывающий
+%% `cb_zkeycloak_ext:provide_keycloak_token/9' печатал его вторым `~p' на
+%% том же самом запросе, обнуляя редакт (`reason=~p'). Диспетчер сводит обе
+%% формы к их редакторам; всё прочее (`'datastore_unreachable'',
+%% `{'missing_user_doc_on_refresh',_}') — атомы/теги без ПДн, отдаём как есть.
+%% Экспортируется в прод-API (в отличие от самих редакторов) именно ради
+%% этого внешнего call-site'а (issue 15, review-loop).
+-spec redact_provisioning_error(any()) -> any().
+redact_provisioning_error({'validation_errors', _} = Err) ->
+    redact_validation_errors(Err);
+redact_provisioning_error({'EXIT', _} = Crash) ->
+    redact_crash(Crash);
+redact_provisioning_error(Other) ->
+    Other.
+
 %% @doc Санитайзер ошибок валидации user-doc'а для лога. Форма
 %% `kazoo_documents:doc_validation_errors()' — список триплетов
 %% `{Path, Code, Msg}' (напр. `{[<<"username">>], <<"unique">>, Msg}');
@@ -725,8 +753,17 @@ redact_validation_error(Other) ->
 %% тег с внутренним значением, ПДн там не по умолчанию.
 -spec redact_crash(any()) -> any().
 redact_crash({'EXIT', {Reason, Stack}}) when is_list(Stack) ->
-    {'EXIT', {Reason, [redact_stack_frame(F) || F <- Stack]}};
+    {'EXIT', {Reason, redact_stack(Stack)}};
 redact_crash(Other) ->
+    Other.
+
+%% @doc Стектрейс без аргументов фреймов — см. `redact_crash/1'. Отдельно от
+%% него, потому что `try/catch'-сайты (`normalize_oidcc/2', `refresh_token/1')
+%% получают `Stack' напрямую, без обёртки `{'EXIT',_}'.
+-spec redact_stack(any()) -> any().
+redact_stack(Stack) when is_list(Stack) ->
+    [redact_stack_frame(F) || F <- Stack];
+redact_stack(Other) ->
     Other.
 
 -spec redact_stack_frame(any()) -> any().
@@ -861,7 +898,17 @@ decode_safe(Token, Verify) ->
 %% передать его в `oidcc:refresh_token/5' opts (`expected_subject').
 -spec jwt_sub_unverified(kz_term:ne_binary()) -> kz_term:ne_binary().
 jwt_sub_unverified(Token) ->
-    [_Header, Payload, _Sig] = binary:split(Token, <<".">>, ['global']),
+    %% issue 15 (review-loop): жёсткий матч `[_H, Payload, _S] = split(...)'
+    %% на не-3-частном токене давал `{badmatch, <части ТОКЕНА>}' — и `Reason'
+    %% с живым refresh уезжал в лог через `~p' в catch-блоке `refresh_token/1'.
+    %% Сейчас это в основном малформный токен клиента (не секрет), но стоит
+    %% realm'у начать выдавать JWE-refresh (5 частей) — и в лог ляжет ЖИВОЙ
+    %% 30-дневный токен целиком. Отказываем атомом, без данных: поведение то
+    %% же (исключение → catch → `{error,_}' → `invalid_credentials'/401).
+    Payload = case binary:split(Token, <<".">>, ['global']) of
+                  [_Header, P, _Sig] -> P;
+                  _Parts -> error('malformed_jwt')
+              end,
     Padded = case byte_size(Payload) rem 4 of
                  0 -> Payload;
                  2 -> <<Payload/binary, "==">>;

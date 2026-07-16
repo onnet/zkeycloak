@@ -463,9 +463,18 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
             issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                              AccountId, OwnerId);
         {'error', Reason} ->
+            %% issue 15 (review-loop): `Reason' приезжает из `create_user/7'
+            %% СЫРЫМ — там редактируется только собственная лог-строка, а
+            %% наверх терм уходит как есть (его ждёт `reject_user_provisioning/3'
+            %% → `add_doc_validation_errors/2', клиенту нужен полный per-field
+            %% error). Без редакта здесь тот же email/UDoc печатался вторым
+            %% `~p' на том же запросе, обнуляя фикс в `create_user/7'.
+            %% Редактируем ЛОГ-копию; в `reject_user_provisioning/3' по-прежнему
+            %% уходит сырой `Reason' — поведение не меняется.
             lager:warning("provide_keycloak_token[~p]: user doc check failed"
                           " owner_id=~p account_id=~p reason=~p",
-                          [Mode, OwnerId, AccountId, Reason]),
+                          [Mode, OwnerId, AccountId
+                          ,zkeycloak_util:redact_provisioning_error(Reason)]),
             reject_user_provisioning(Context, Mode, Reason)
     end.
 

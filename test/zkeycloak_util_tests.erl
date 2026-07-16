@@ -34,6 +34,7 @@
 -define(REFRESH, <<"eyJhbGciOiJIUzI1NiJ9.refresh-secret-tail-30d">>).
 -define(SECRET_TAIL, <<"refresh-secret-tail-30d">>).
 -define(EMAIL, <<"ivan.petrov@brterminal.ru">>).
+-define(SUB, <<"01234567-89ab-cdef-0123-456789abcdef">>).
 
 %%%=============================================================================
 %%% redact/1
@@ -341,6 +342,79 @@ redact_crash_strips_stack_frame_args_test() ->
 
 redact_crash_non_exit_passthrough_test() ->
     ?assertEqual('some_atom', zkeycloak_util:redact_crash('some_atom')).
+
+%%%=============================================================================
+%%% redact_provisioning_error/1 — редакт на ВЫЗЫВАЮЩЕЙ стороне (review-loop)
+%%%=============================================================================
+
+redact_provisioning_error_masks_validation_errors_test() ->
+    %% `create_user/7' отдаёт Reason наверх СЫРЫМ, и
+    %% `cb_zkeycloak_ext:provide_keycloak_token/9' печатал его вторым `~p'
+    %% на том же запросе — редакт в create_user без этого бесполезен.
+    R = zkeycloak_util:redact_provisioning_error(username_unique_error()),
+    ?assertEqual('nomatch', binary:match(?FMT(R), ?EMAIL)).
+
+redact_provisioning_error_masks_crash_test() ->
+    UDoc = kz_json:from_list([{<<"email">>, ?EMAIL}]),
+    Crash = {'EXIT', {'function_clause'
+                     ,[{'kzd_users', 'validate', [<<"acc">>, <<"usr">>, UDoc], []}]}},
+    ?assertEqual('nomatch', binary:match(?FMT(zkeycloak_util:redact_provisioning_error(Crash))
+                                        ,?EMAIL)).
+
+redact_provisioning_error_passthrough_test() ->
+    %% Прочие причины — атомы/теги без ПДн, диагностика должна выжить.
+    ?assertEqual('datastore_unreachable'
+                ,zkeycloak_util:redact_provisioning_error('datastore_unreachable')),
+    ?assertEqual({'missing_user_doc_on_refresh', {'error', 'not_found'}}
+                ,zkeycloak_util:redact_provisioning_error(
+                   {'missing_user_doc_on_refresh', {'error', 'not_found'}})).
+
+%%%=============================================================================
+%%% redact_stack/1 — аргументы во фреймах try/catch-сайтов (review-loop)
+%%%=============================================================================
+
+redact_stack_masks_oidcc_client_secret_test() ->
+    %% `normalize_oidcc/2` оборачивает `oidcc:retrieve_token(AuthCode, _,
+    %% ClientId, ClientSecret, _)' — фрейм с args несёт code И client_secret.
+    Stack = [{'oidcc', 'retrieve_token'
+             ,[<<"auth-code-live">>, 'client_id', <<"onbill_client">>
+              ,<<"super-secret-client-secret">>, #{}]
+             ,[{'file',"oidcc.erl"},{'line',42}]}
+            ],
+    Fmt = ?FMT(zkeycloak_util:redact_stack(Stack)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"super-secret-client-secret">>)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"auth-code-live">>)),
+    %% M:F/A + location остаются
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"retrieve_token">>)),
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"42">>)).
+
+redact_stack_arity_frame_and_non_list_passthrough_test() ->
+    %% фрейм уже с арностью — не трогаем; не-список — fail-safe.
+    Frame = [{'m', 'f', 3, [{'line',7}]}],
+    ?assertEqual(Frame, zkeycloak_util:redact_stack(Frame)),
+    ?assertEqual('undefined', zkeycloak_util:redact_stack('undefined')).
+
+%%%=============================================================================
+%%% jwt_sub_unverified/1 — токен не должен попадать в Reason (review-loop)
+%%%=============================================================================
+
+jwt_sub_unverified_malformed_token_not_in_reason_test() ->
+    %% Жёсткий матч давал `{badmatch, <части токена>}' → Reason с ЖИВЫМ
+    %% refresh уезжал в лог catch-блока `refresh_token/1'. Например, если
+    %% realm начнёт выдавать JWE-refresh (5 частей).
+    Jwe = <<"hdr.enckey.iv.ciphertext.tag-LIVE-SECRET">>,
+    Reason = try zkeycloak_util:jwt_sub_unverified(Jwe), 'no_error'
+             catch _C:R -> R
+             end,
+    ?assertEqual('malformed_jwt', Reason),
+    ?assertEqual('nomatch', binary:match(?FMT(Reason), <<"LIVE-SECRET">>)).
+
+jwt_sub_unverified_happy_path_test() ->
+    %% Поведение на валидном JWT не изменилось.
+    Payload = base64:encode(kz_json:encode(kz_json:from_list([{<<"sub">>, ?SUB}]))
+                           ,#{'mode' => 'urlsafe', 'padding' => 'false'}),
+    Token = <<"hdr.", Payload/binary, ".sig">>,
+    ?assertEqual(?SUB, zkeycloak_util:jwt_sub_unverified(Token)).
 
 %%%=============================================================================
 %%% redact_token_result/1 — fail-closed на неузнанной ok-форме (issue 15)
