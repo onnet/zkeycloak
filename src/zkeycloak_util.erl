@@ -34,6 +34,17 @@
         ]
        ).
 
+-ifdef(TEST).
+%% Внутренние санитайзеры лога, открытые для EUnit (`zkeycloak_util_tests').
+%% В прод-API не выносим: наружу нужны только `redact*'/`claims_digest',
+%% остальное — детали конкретных лог-строк этого модуля.
+-export([redact_pii/1
+        ,redact_validation_errors/1
+        ,redact_crash/1
+        ,redact_token_result/1
+        ]).
+-endif.
+
 %% @doc HTTP-заголовки, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми: несут
 %% живой Bearer-токен (`authorization'), Kazoo auth-token (`x-auth-token'),
 %% session-cookie или proxy-креды. Имена сравниваем в нижнем регистре
@@ -125,6 +136,23 @@
                          ,<<"realm_access">>
                          ,<<"account_id">>
                          ]).
+
+%% @doc Ключи внутри ошибок валидации (`kzd_users:validate/3'), под которыми
+%% лежит ЭХО отвергнутого значения, т.е. ПДн из claim'ов KC. Живой путь:
+%% `kzd_users:maybe_validate_username_is_unique/3' кладёт `{<<"cause">>,
+%% Username}', а `create_user/7' подставляет в `username' именно `Email' —
+%% т.е. коллизия username'а печатала email целиком. Схемные отказы
+%% (`kz_json_schema:error_to_jobj/2') кладут отвергнутое значение в
+%% `value'/`cause' — то же самое для `first_name'/`last_name'/`email'.
+%% См. `redact_validation_errors/1' (issue 15).
+-define(SENSITIVE_ERROR_KEYS, [<<"value">>
+                              ,<<"cause">>
+                              ]).
+
+%% Префикс секрета в логе и минимальная длина, при которой его вообще есть
+%% смысл печатать: 6 из >=24 байт — малая доля, 6 из 7 — весь секрет.
+-define(REDACT_PREFIX_LEN, 6).
+-define(REDACT_MIN_LEN_FOR_PREFIX, 24).
 
 -define(MK_USER,
         {[{<<"enabled">>, 'true'}
@@ -474,15 +502,40 @@ refresh_token(RefreshToken) ->
 %% в Crossbar-500 (тот же класс, что чинили issue 05/07/10: чистый ответ
 %% вместо badmatch-500), причём неаутентифицированным запросом. Секрет при
 %% этом всё равно не печатаем — на любой непечатаемой форме отдаём сентинел.
+%%
+%% Префикс печатается ТОЛЬКО у значений от ?REDACT_MIN_LEN_FOR_PREFIX байт:
+%% у короткого секрета `min(6, Len)' выдавал его целиком (`redact(<<"hunter2">>)'
+%% → `<<"hunter..(len=7)">>'). Для issue 01 это не стреляло — там только
+%% JWT/hex-креды в сотни байт, — но issue 15 завёл в ?SENSITIVE_BODY_KEYS
+%% `password', который короткий по природе. Ниже порога печатаем только длину.
 -spec redact(any()) -> kz_term:ne_binary().
 redact('undefined') -> <<"undefined">>;
 redact(<<>>) -> <<"empty">>;
+redact(Value) when is_binary(Value), byte_size(Value) < ?REDACT_MIN_LEN_FOR_PREFIX ->
+    <<"redacted(len=", (integer_to_binary(byte_size(Value)))/binary, ")">>;
 redact(Value) when is_binary(Value) ->
     Len = byte_size(Value),
-    Prefix = binary:part(Value, 0, min(6, Len)),
+    Prefix = binary:part(Value, 0, ?REDACT_PREFIX_LEN),
     <<Prefix/binary, "..(len=", (integer_to_binary(Len))/binary, ")">>;
 redact(Value) ->
     try redact(kz_term:to_binary(Value))
+    catch
+        _Class:_Reason -> <<"redacted(unprintable)">>
+    end.
+
+%% @doc Маскирование ПДн-значения (email/ФИО, эхнутые KC или валидатором).
+%% В отличие от `redact/1' префикс НЕ печатаем совсем, по двум причинам:
+%% (а) 6 байт email'а/ФИО — это всё ещё ПДн, корреляция по ним не нужна
+%% (для неё есть `owner_id'/`account_id'); (б) ФИО в UTF-8 (кириллица —
+%% 2 байта на символ), и побайтовый префикс режет символ пополам → в лог
+%% уходит битый UTF-8. Печатаем только факт и длину (issue 15).
+-spec redact_pii(any()) -> kz_term:ne_binary().
+redact_pii('undefined') -> <<"undefined">>;
+redact_pii(<<>>) -> <<"empty">>;
+redact_pii(Value) when is_binary(Value) ->
+    <<"redacted(len=", (integer_to_binary(byte_size(Value)))/binary, ")">>;
+redact_pii(Value) ->
+    try redact_pii(kz_term:to_binary(Value))
     catch
         _Class:_Reason -> <<"redacted(unprintable)">>
     end.
@@ -534,26 +587,47 @@ redact_header_kv(Key, Value) ->
 -spec redact_req_data(kz_json:object() | kz_json:json_term()) ->
           kz_json:object() | kz_json:json_term().
 redact_req_data(Value) ->
+    redact_json(Value, ?SENSITIVE_BODY_KEYS, fun redact/1).
+
+%% @doc Рекурсивный key-wise редактор JSON-терма: значения ключей из `Keys'
+%% пропускаются через `Redactor', структура и остальные поля сохраняются.
+%% Параметризован, потому что мест применения два с РАЗНЫМИ доменами:
+%% тело запроса (креды → `redact/1', префикс+длина) и ошибки валидации
+%% (ПДн → `redact_pii/1', без префикса). См. `redact_req_data/1' и
+%% `redact_validation_errors/1' (issue 15).
+-spec redact_json(kz_json:json_term()
+                 ,[kz_term:ne_binary()]
+                 ,fun((any()) -> kz_term:ne_binary())
+                 ) -> kz_json:json_term().
+redact_json(Value, Keys, Redactor) ->
     case kz_json:is_json_object(Value) of
-        'true' -> kz_json:map(fun redact_req_data_kv/2, Value);
-        'false' -> redact_req_data_term(Value)
+        'true' ->
+            kz_json:map(fun(K, V) -> redact_json_kv(K, V, Keys, Redactor) end, Value);
+        'false' ->
+            redact_json_term(Value, Keys, Redactor)
     end.
 
--spec redact_req_data_kv(kz_json:key(), kz_json:json_term()) ->
-          {kz_json:key(), kz_json:json_term()}.
-redact_req_data_kv(Key, Value) ->
-    case is_sensitive_key(Key, ?SENSITIVE_BODY_KEYS) of
-        'true' -> {Key, redact(Value)};
-        'false' -> {Key, redact_req_data(Value)}
+-spec redact_json_kv(kz_json:key()
+                    ,kz_json:json_term()
+                    ,[kz_term:ne_binary()]
+                    ,fun((any()) -> kz_term:ne_binary())
+                    ) -> {kz_json:key(), kz_json:json_term()}.
+redact_json_kv(Key, Value, Keys, Redactor) ->
+    case is_sensitive_key(Key, Keys) of
+        'true' -> {Key, Redactor(Value)};
+        'false' -> {Key, redact_json(Value, Keys, Redactor)}
     end.
 
 %% @doc Не-объектный JSON-терм: массив обходим поэлементно (в нём могут
 %% лежать объекты с кредами), скаляр возвращаем как есть. kz_json-объект
 %% сюда не попадает — он tuple (`?JSON_WRAPPER'), его снял `is_json_object/1'.
--spec redact_req_data_term(kz_json:json_term()) -> kz_json:json_term().
-redact_req_data_term(Values) when is_list(Values) ->
-    [redact_req_data(V) || V <- Values];
-redact_req_data_term(Value) ->
+-spec redact_json_term(kz_json:json_term()
+                      ,[kz_term:ne_binary()]
+                      ,fun((any()) -> kz_term:ne_binary())
+                      ) -> kz_json:json_term().
+redact_json_term(Values, Keys, Redactor) when is_list(Values) ->
+    [redact_json(V, Keys, Redactor) || V <- Values];
+redact_json_term(Value, _Keys, _Redactor) ->
     Value.
 
 %% @doc Log-safe выжимка claim'ов KC (`ClaimsMap' id_token'а, `UserInfoMap'
@@ -594,8 +668,15 @@ is_sensitive_key(_Key, _Names) ->
     'false'.
 
 %% @doc Санитайзер oidcc-результата refresh для лога: сохраняем структуру
-%% (ok/error + наличие полей), но маскируем сами токены. Catch-all делает
-%% хелпер fail-safe — на неожиданной форме просто печатает её как есть.
+%% (ok/error + наличие полей), но маскируем сами токены.
+%%
+%% `{ok,_}' неузнанной формы — fail-CLOSED (issue 15): ok-клоуз матчит жёсткую
+%% 5-tuple `oidcc_token', и любое расхождение (бамп oidcc, смена record'а)
+%% уводило успешный результат — а это ЖИВЫЕ access+refresh+id — в общий
+%% `~p'-catch-all, т.е. ровно в ту утечку, которую этот хелпер и закрывает,
+%% но молча и без теста. Печатаем сентинел: на такой строке в логе видно, что
+%% форма разъехалась, а токены не утекают. `{error,_}'/прочее печатаем как
+%% есть — там причина отказа KC, не креды.
 -spec redact_token_result(any()) -> kz_term:ne_binary().
 redact_token_result({'ok', {'oidcc_token'
                            ,{'oidcc_token_id', Id, _Claims}
@@ -606,8 +687,53 @@ redact_token_result({'ok', {'oidcc_token'
     <<"{ok,oidcc_token id=", (redact(Id))/binary
      ," access=", (redact(Access))/binary
      ," refresh=", (redact(Refresh))/binary, "}">>;
+redact_token_result({'ok', _Unrecognized}) ->
+    <<"{ok,<unrecognized oidcc_token shape — redacted>}">>;
 redact_token_result(Other) ->
     kz_term:to_binary(io_lib:format("~p", [Other])).
+
+%% @doc Санитайзер ошибок валидации user-doc'а для лога. Форма
+%% `kazoo_documents:doc_validation_errors()' — список триплетов
+%% `{Path, Code, Msg}' (напр. `{[<<"username">>], <<"unique">>, Msg}');
+%% диагностика живёт в `Path'+`Code' («какое поле и чем не угодило»), а ПДн —
+%% в `Msg' под `value'/`cause'. Поэтому триплет сохраняем целиком и
+%% редактируем ТОЛЬКО значения ?SENSITIVE_ERROR_KEYS внутри `Msg' — в отличие
+%% от дропа третьего элемента, который убил бы и `message' («Username must be
+%% unique»), т.е. смысл лога.
+%%
+%% ВАЖНО: это ЛОГ-копия. Наверх (`{'error', Err}' → `reject_user_provisioning/3'
+%% → `add_doc_validation_errors/2') по-прежнему уходит СЫРОЙ `Err' — клиенту
+%% нужен полный per-field error, поведение не меняется (issue 15).
+-spec redact_validation_errors(any()) -> any().
+redact_validation_errors({'validation_errors', Errors}) when is_list(Errors) ->
+    {'validation_errors', [redact_validation_error(E) || E <- Errors]};
+redact_validation_errors(Other) ->
+    Other.
+
+-spec redact_validation_error(any()) -> any().
+redact_validation_error({Path, Code, Msg}) ->
+    {Path, Code, redact_json(Msg, ?SENSITIVE_ERROR_KEYS, fun redact_pii/1)};
+redact_validation_error(Other) ->
+    Other.
+
+%% @doc Санитайзер `catch'-результата для лога: `{'EXIT', {Reason, Stack}}'.
+%% На `function_clause'/BIF-`badarg' Erlang кладёт в фрейм стектрейса РЕАЛЬНЫЕ
+%% аргументы вызова, а сюда приезжает `kzd_users:validate(_, _, UDoc)' — т.е.
+%% ФИО, email и сгенерированный пароль целиком (issue 15). Заменяем список
+%% аргументов на арность: `M:F/A' + location для диагностики краша достаточно.
+%% `Reason' оставляем как есть — обычно это атом (`function_clause') либо
+%% тег с внутренним значением, ПДн там не по умолчанию.
+-spec redact_crash(any()) -> any().
+redact_crash({'EXIT', {Reason, Stack}}) when is_list(Stack) ->
+    {'EXIT', {Reason, [redact_stack_frame(F) || F <- Stack]}};
+redact_crash(Other) ->
+    Other.
+
+-spec redact_stack_frame(any()) -> any().
+redact_stack_frame({M, F, Args, Loc}) when is_list(Args) ->
+    {M, F, length(Args), Loc};
+redact_stack_frame(Frame) ->
+    Frame.
 
 %% @doc Присутствует ли поле — для presence-логов вместо значений-ПДн
 %% (`create_user/7', issue 15). `undefined'/пусто = отсутствует.
@@ -690,13 +816,20 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
             lager:info("create_user Result: ~s", [redact_user_doc_result(Result)]),
             Result;
         {'validation_errors', _} = Err ->
-            lager:info("create_user Err: ~p", [Err]),
+            %% issue 15: ошибки валидации ЭХАЮТ отвергнутое значение
+            %% (`cause'/`value'), а `username' здесь = `Email' — коллизия
+            %% username'а печатала email целиком. Редактируем ЛОГ-копию;
+            %% наверх уходит сырой `Err' (клиенту нужен полный per-field error).
+            lager:info("create_user Err: ~p", [redact_validation_errors(Err)]),
             {'error', Err};
         {'system_error', _} = Err ->
             lager:warning("create_user system_error: ~p", [Err]),
             {'error', Err};
         Crash ->
-            lager:error("create_user crashed: ~p", [Crash]),
+            %% issue 15: `catch' отдаёт `{'EXIT',{Reason,Stack}}', а фрейм
+            %% стектрейса на function_clause/badarg несёт АРГУМЕНТЫ вызова —
+            %% т.е. весь `UDoc' (ФИО, email, пароль). Логируем M:F/A без args.
+            lager:error("create_user crashed: ~p", [redact_crash(Crash)]),
             {'error', Crash}
     end.
 

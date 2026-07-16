@@ -62,9 +62,28 @@ redact_total_on_client_shaped_terms_test() ->
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([{[{<<"x">>,1}]}])),
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([1000])),
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact(#{a => 1})),
-    %% печатаемые не-binary формы по-прежнему маскируются, а не глушатся
-    ?assertMatch(<<"{\"a\":1", _/binary>>, zkeycloak_util:redact({[{<<"a">>,1}]})),
-    ?assertEqual(<<"12345..(len=5)">>, zkeycloak_util:redact(12345)).
+    %% печатаемые не-binary формы маскируются, а не глушатся
+    ?assertEqual(<<"redacted(len=7)">>, zkeycloak_util:redact({[{<<"a">>,1}]})),
+    ?assertEqual(<<"redacted(len=5)">>, zkeycloak_util:redact(12345)).
+
+redact_short_secret_hides_prefix_test() ->
+    %% `min(6, Len)' выдавал короткий секрет целиком; в ?SENSITIVE_BODY_KEYS
+    %% есть `password', который короткий по природе.
+    ?assertEqual(<<"redacted(len=7)">>, zkeycloak_util:redact(<<"hunter7">>)),
+    %% на границе порога префикс появляется — и это малая доля секрета
+    Long = <<"abcdefghijklmnopqrstuvwx">>, %% ровно 24
+    ?assertEqual(<<"abcdef..(len=24)">>, zkeycloak_util:redact(Long)).
+
+redact_pii_never_reveals_prefix_test() ->
+    %% ПДн: префикс не печатаем совсем — 6 байт email'а это всё ещё ПДн,
+    %% а на кириллице побайтовый префикс резал бы символ пополам.
+    ?assertEqual(<<"redacted(len=25)">>, zkeycloak_util:redact_pii(?EMAIL)),
+    ?assertEqual(<<"undefined">>, zkeycloak_util:redact_pii('undefined')),
+    Fio = <<"Пётр"/utf8>>,
+    R = zkeycloak_util:redact_pii(Fio),
+    ?assertEqual('nomatch', binary:match(R, <<"Пёт"/utf8>>)),
+    %% результат — валидный UTF-8 (битого префикса в логе не будет)
+    ?assertNotEqual('error', unicode:characters_to_binary(R, 'utf8')).
 
 redact_req_data_object_valued_secret_no_crash_test() ->
     %% Тот же вектор через публичную дверь: credential-ключ со значением-
@@ -259,3 +278,78 @@ claims_digest_unexpected_shape_fails_closed_test() ->
 
 claims_digest_empty_claims_test() ->
     ?assertEqual(#{'redacted_keys' => []}, zkeycloak_util:claims_digest(#{})).
+
+%%%=============================================================================
+%%% redact_validation_errors/1 (issue 15) — эхо ПДн в ошибках валидации
+%%%=============================================================================
+
+%% Форма `kzd_users:maybe_validate_username_is_unique/3': в `create_user/7'
+%% `username' = Email, поэтому коллизия печатала email целиком.
+username_unique_error() ->
+    Msg = kz_json:from_list([{<<"message">>, <<"Username must be unique within account">>}
+                            ,{<<"cause">>, ?EMAIL}
+                            ]),
+    {'validation_errors', [{[<<"username">>], <<"unique">>, Msg}]}.
+
+redact_validation_errors_masks_echoed_email_test() ->
+    R = zkeycloak_util:redact_validation_errors(username_unique_error()),
+    ?assertEqual('nomatch', binary:match(?FMT(R), ?EMAIL)).
+
+redact_validation_errors_keeps_diagnostics_test() ->
+    %% Диагностика обязана выжить: какое поле, чем не угодило и человеческий
+    %% message — иначе лог бесполезен («у LDAP-юзера пустой sn»).
+    {'validation_errors', [{Path, Code, Msg}]} =
+        zkeycloak_util:redact_validation_errors(username_unique_error()),
+    ?assertEqual([<<"username">>], Path),
+    ?assertEqual(<<"unique">>, Code),
+    ?assertEqual(<<"Username must be unique within account">>
+                ,kz_json:get_value(<<"message">>, Msg)).
+
+redact_validation_errors_masks_schema_value_test() ->
+    %% `kz_json_schema:error_to_jobj/2' кладёт отвергнутое значение в `value'.
+    Msg = kz_json:from_list([{<<"message">>, <<"String must be at least 1 characters">>}
+                            ,{<<"value">>, <<"Пётр"/utf8>>}
+                            ]),
+    Err = {'validation_errors', [{[<<"first_name">>], <<"minLength">>, Msg}]},
+    ?assertEqual('nomatch', binary:match(?FMT(zkeycloak_util:redact_validation_errors(Err))
+                                        ,<<"Пётр"/utf8>>)).
+
+redact_validation_errors_unexpected_shape_passthrough_test() ->
+    ?assertEqual({'system_error', 'datastore_fault'}
+                ,zkeycloak_util:redact_validation_errors({'system_error', 'datastore_fault'})).
+
+%%%=============================================================================
+%%% redact_crash/1 (issue 15) — аргументы в стектрейсе
+%%%=============================================================================
+
+redact_crash_strips_stack_frame_args_test() ->
+    %% `catch kzd_users:validate(_,_,UDoc)' на function_clause кладёт в фрейм
+    %% РЕАЛЬНЫЕ аргументы — весь UDoc: ФИО, email, пароль.
+    UDoc = kz_json:from_list([{<<"email">>, ?EMAIL}
+                             ,{<<"password">>, <<"generated-secret">>}
+                             ]),
+    Crash = {'EXIT', {'function_clause'
+                     ,[{'kzd_users', 'validate', [<<"acc">>, <<"usr">>, UDoc]
+                       ,[{'file',"kzd_users.erl"},{'line',1027}]}
+                      ]}},
+    Fmt = ?FMT(zkeycloak_util:redact_crash(Crash)),
+    ?assertEqual('nomatch', binary:match(Fmt, ?EMAIL)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"generated-secret">>)),
+    %% M:F/A + location остаются — краш диагностируется
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"kzd_users">>)),
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"1027">>)).
+
+redact_crash_non_exit_passthrough_test() ->
+    ?assertEqual('some_atom', zkeycloak_util:redact_crash('some_atom')).
+
+%%%=============================================================================
+%%% redact_token_result/1 — fail-closed на неузнанной ok-форме (issue 15)
+%%%=============================================================================
+
+redact_token_result_unrecognized_ok_fails_closed_test() ->
+    %% Бамп oidcc / смена record'а не должны молча вывалить живые токены.
+    Live = {'ok', {'oidcc_token_v9', <<"live-access-token-payload">>
+                  ,<<"live-refresh-token-payload">>}},
+    R = zkeycloak_util:redact_token_result(Live),
+    ?assertEqual('nomatch', binary:match(R, <<"live-access-token-payload">>)),
+    ?assertEqual('nomatch', binary:match(R, <<"live-refresh-token-payload">>)).
