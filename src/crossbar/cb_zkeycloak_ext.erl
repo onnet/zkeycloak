@@ -357,8 +357,29 @@ authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mod
                             ,'login' | 'refresh'
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode) ->
+    %% issue 07: `sub' обязан быть KIS-производным UUID (SPI `toUuidFormat');
+    %% LDAP/service-account/federated субъекты несут иной формат — их KIS
+    %% owner_id не существует, отказываем чисто вместо function_clause-500.
+    case zcore_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap), 'undefined') of
+        'undefined' ->
+            lager:info("provide_keycloak_token[~p]: sub is not a KIS-derived uuid"
+                       " (LDAP/service-account/federated subject?) — rejecting", [Mode]),
+            cb_context:add_system_error('invalid_credentials', Context);
+        OwnerId ->
+            provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh,
+                                   UserInfoMap, Mode, OwnerId)
+    end.
+
+-spec provide_keycloak_token(cb_context:context()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,map()
+                            ,'login' | 'refresh'
+                            ,kz_term:ne_binary()
+                            ) -> cb_context:context().
+provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode, OwnerId) ->
     AccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
-    OwnerId = zbrt_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap)),
     DbName = kzs_util:format_account_id(AccountId, 'encoded'),
 
     case check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap) of
