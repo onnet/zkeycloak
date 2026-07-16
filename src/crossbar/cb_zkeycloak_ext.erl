@@ -13,6 +13,13 @@
 
 -include("/opt/kazoo/applications/crossbar/src/crossbar.hrl").
 
+-ifdef(TEST).
+%% Внутренние auth-гейты, открытые для EUnit (`cb_zkeycloak_ext_tests').
+-export([provide_keycloak_token/6
+        ,provide_keycloak_token/7
+        ]).
+-endif.
+
 %%-include("zbrt_defs.hrl").
 %%-define(HEADERS, [{"content-type", "application/x-www-form-urlencoded"}]).
 -define(HEADERS, [{"content-type", "application/json"}]).
@@ -372,9 +379,16 @@ authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mod
                             ,'login' | 'refresh'
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode) ->
-    %% issue 07: `sub' обязан быть KIS-производным UUID (SPI `toUuidFormat');
-    %% LDAP/service-account/federated субъекты несут иной формат — их KIS
-    %% owner_id не существует, отказываем чисто вместо function_clause-500.
+    %% issue 07 + P3-1 (кросс-ревью 16.07): гейт проверяет СТРУКТУРУ `sub' —
+    %% `zcore_util:from_key/2' матчит только дефисный UUID (MDM-key) и
+    %% возвращает KIS owner_id, иначе `'undefined''. Структурно-невалидный
+    %% `sub' (federated `f:<idp>:<user>', client-id сервис-аккаунта) →
+    %% чистый 401 вместо function_clause-500.
+    %% NB: комментарий НАМЕРЕННО не утверждает «sub обязан быть KIS-derived» —
+    %% LDAP/Kerberos-субъекты тоже несут дефисный UUID и СТРУКТУРНО проходят
+    %% этот гейт (это и требуется — `ensure_user_doc' рассчитан на LDAP-юзеров);
+    %% их отсекает следующий гейт (`account_id'), если KazooAuth-claim'а нет.
+    %% «Фикс» до буквы старого комментария сломал бы LDAP/Kerberos-логин.
     case zcore_util:from_key(kz_maps:get(<<"sub">>, UserInfoMap), 'undefined') of
         'undefined' ->
             lager:info("provide_keycloak_token[~p]: sub is not a KIS-derived uuid"
@@ -394,18 +408,26 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                             ,kz_term:ne_binary()
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode, OwnerId) ->
-    %% issue 10: claim `account_id' ставит только SPI-путь handleKazooAuth;
-    %% userinfo без него (LDAP/federated) раньше уезжал undefined'ом в
-    %% format_account_id/open_doc/create_user — грязный сбой вместо 401.
+    %% issue 10 + P3 (кросс-ревью 16.07): claim `account_id' ставит только
+    %% SPI-путь `handleKazooAuth' и всегда в raw-форме (32 hex). Отсутствие
+    %% claim'а закрыл `a1eae36'; но пустой (`<<>>') либо малформный (не-32-
+    %% байтный) `account_id' проходил `undefined'-гейт и падал badmatch'ем в
+    %% `kzs_util:format_account_id/2' (`?MATCH_ACCOUNT_RAW = raw_account_id(_)'
+    %% на catch-all не матчится: `<<>>'/`<<"not-32-hex">>' → `error:{badmatch,_}')
+    %% → грязный Crossbar-500 вместо 401. Гейтим строго на raw-account-id
+    %% формат — единственную форму, которую `format_account_id/2` не роняет и
+    %% которую реально шлёт SPI. Всё прочее (`undefined'/`<<>>'/малформ) →
+    %% чистый 401 `invalid_credentials' (образец `a1eae36').
     case kz_maps:get(<<"account_id">>, UserInfoMap) of
-        'undefined' ->
-            lager:info("provide_keycloak_token[~p]: userinfo has no account_id claim"
-                       " owner_id=~s (non-KazooAuth subject?) — rejecting", [Mode, OwnerId]),
-            cb_context:add_system_error('invalid_credentials', Context);
-        AccountId ->
+        ?MATCH_ACCOUNT_RAW(AccountId) ->
             DbName = kzs_util:format_account_id(AccountId, 'encoded'),
             provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh,
-                                   UserInfoMap, Mode, OwnerId, AccountId, DbName)
+                                   UserInfoMap, Mode, OwnerId, AccountId, DbName);
+        Other ->
+            lager:info("provide_keycloak_token[~p]: userinfo account_id absent or"
+                       " malformed (~p) owner_id=~s (non-KazooAuth subject?) — rejecting",
+                       [Mode, Other, OwnerId]),
+            cb_context:add_system_error('invalid_credentials', Context)
     end.
 
 -spec provide_keycloak_token(cb_context:context()
