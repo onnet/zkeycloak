@@ -461,7 +461,20 @@ refresh_token(RefreshToken) ->
 %% сессии. Сырой токен в логах = 30-дневный replay при утечке лог-архива
 %% (issue 01 кросс-слойного KC-auth ревью). `lager'-вызов сохраняем —
 %% редактируем только ЗНАЧЕНИЕ (правило проекта: не вырезать lager).
--spec redact(kz_term:api_binary()) -> kz_term:ne_binary().
+%%
+%% Домен — `any()', а не `api_binary()': фактический (спека врала — issue 15).
+%% `redact_header_kv/2' кормит сюда `term()' (значение заголовка), а
+%% `redact_req_data_kv/2' — произвольный `kz_json:json_term()' из ТЕЛА
+%% запроса, форму которого диктует КЛИЕНТ и до аутентификации
+%% (`authorize/1' отрабатывает раньше неё).
+%%
+%% Отсюда же тотальность: `kz_term:to_binary/1' ЧАСТИЧЕН — на JSON-массиве
+%% из объектов/чисел >255 (`iolist_to_binary' → badarg) и на map он падает.
+%% Без `try' тело вида `{"refresh_token":[{"x":1}]}' роняло бы `authorize/1'
+%% в Crossbar-500 (тот же класс, что чинили issue 05/07/10: чистый ответ
+%% вместо badmatch-500), причём неаутентифицированным запросом. Секрет при
+%% этом всё равно не печатаем — на любой непечатаемой форме отдаём сентинел.
+-spec redact(any()) -> kz_term:ne_binary().
 redact('undefined') -> <<"undefined">>;
 redact(<<>>) -> <<"empty">>;
 redact(Value) when is_binary(Value) ->
@@ -469,7 +482,10 @@ redact(Value) when is_binary(Value) ->
     Prefix = binary:part(Value, 0, min(6, Len)),
     <<Prefix/binary, "..(len=", (integer_to_binary(Len))/binary, ")">>;
 redact(Value) ->
-    redact(kz_term:to_binary(Value)).
+    try redact(kz_term:to_binary(Value))
+    catch
+        _Class:_Reason -> <<"redacted(unprintable)">>
+    end.
 
 %% @doc Санитизация HTTP-заголовков перед логированием: значения
 %% credential-заголовков (`authorization', `cookie', `x-auth-token' и пр.,

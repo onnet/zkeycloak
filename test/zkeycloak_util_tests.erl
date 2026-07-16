@@ -53,6 +53,26 @@ redact_binary_masks_tail_test() ->
     ?assertEqual('nomatch', binary:match(Masked, <<"secret-tail-9f8e7d">>)),
     ?assert(byte_size(Masked) < byte_size(Secret)).
 
+redact_total_on_client_shaped_terms_test() ->
+    %% `redact/1' кормится значениями из ТЕЛА, форму которых задаёт клиент —
+    %% и `authorize/1' зовётся ДО аутентификации. `kz_term:to_binary/1'
+    %% частичен (badarg на списке объектов / числе >255 / map), поэтому
+    %% redact обязан быть тотальным: иначе тело `{"refresh_token":[{"x":1}]}'
+    %% роняет authorize в Crossbar-500 неаутентифицированным запросом.
+    ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([{[{<<"x">>,1}]}])),
+    ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([1000])),
+    ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact(#{a => 1})),
+    %% печатаемые не-binary формы по-прежнему маскируются, а не глушатся
+    ?assertMatch(<<"{\"a\":1", _/binary>>, zkeycloak_util:redact({[{<<"a">>,1}]})),
+    ?assertEqual(<<"12345..(len=5)">>, zkeycloak_util:redact(12345)).
+
+redact_req_data_object_valued_secret_no_crash_test() ->
+    %% Тот же вектор через публичную дверь: credential-ключ со значением-
+    %% массивом объектов. Должно быть замаскировано и без краша.
+    Body = kz_json:from_list([{<<"refresh_token">>, [kz_json:from_list([{<<"x">>,1}])]}]),
+    ?assertEqual(<<"redacted(unprintable)">>
+                ,kz_json:get_value(<<"refresh_token">>, zkeycloak_util:redact_req_data(Body))).
+
 %%%=============================================================================
 %%% redact_headers/1 — map-форма (cowboy:http_headers())
 %%%=============================================================================
