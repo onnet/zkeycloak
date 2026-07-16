@@ -332,6 +332,21 @@ authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mod
     case zkeycloak_util:retrieve_userinfo(TokenTuple) of
         {'ok', UserInfoMap} ->
             lager:info("authorize_and_issue[~p]  UserInfoMap: ~p", [Mode, UserInfoMap]),
+            %% KC-auth ревью (issue 13, backend): роль-гейт читает
+            %% `resource_access.onbill_client.roles' из USERINFO, а не из
+            %% access-токена. KC отдаёт `resource_access' в userinfo ТОЛЬКО
+            %% при включённом флаге маппера «Add to userinfo» на клиенте
+            %% `onbill_client'. Если флаг выключен — `UserInfoRoles = []' и
+            %% гейт деним ВСЕХ (fail-closed: безопасно, но хрупкая привязка к
+            %% realm-конфигу — «молчаливый» отказ всех логинов вместо явной
+            %% ошибки). Инвариант держится realm-настройкой, кодом не
+            %% гарантируется → проверять флаг на стенде при любом
+            %% реконфиге realm (в частности — в окно апгрейда KC 23→26.6.3).
+            %% NB: гейт токен-пути (`zkeycloak_util:validate_onbill_access/1',
+            %% для внешних KC-issued токенов) читает те же роли из КЛЕЙМОВ
+            %% access-токена и от флага userinfo НЕ зависит — здесь оставляем
+            %% userinfo-источник как есть (смена источника = поведенческое
+            %% изменение, требует стенд-приёмки; вне scope low-sev бэклога).
             UserInfoRoles = kz_maps:get([<<"resource_access">>
                                         ,<<"onbill_client">>
                                         ,<<"roles">>], UserInfoMap, []),
