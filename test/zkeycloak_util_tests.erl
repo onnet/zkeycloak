@@ -62,7 +62,7 @@ redact_total_on_client_shaped_terms_test() ->
     %% роняет authorize в Crossbar-500 неаутентифицированным запросом.
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([{[{<<"x">>,1}]}])),
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([1000])),
-    ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact(#{a => 1})),
+    ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact(#{'a' => 1})),
     %% печатаемые не-binary формы маскируются, а не глушатся
     ?assertEqual(<<"redacted(len=7)">>, zkeycloak_util:redact({[{<<"a">>,1}]})),
     ?assertEqual(<<"redacted(len=5)">>, zkeycloak_util:redact(12345)).
