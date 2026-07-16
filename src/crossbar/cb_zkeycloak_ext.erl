@@ -63,7 +63,11 @@ resource_exists(?ZKEYCLOAK) -> 'true'.
 
 -spec authorize(cb_context:context()) -> boolean() | {'stop', cb_context:context()}.
 authorize(Context) ->
-    lager:info("authorisze/1  req_data: ~p",[cb_context:req_data(Context)]),
+    %% issue 15: `authorize/1' зовётся и на `POST /zkeycloak_ext/refresh' —
+    %% сырой `~p' тела клал в лог 30-дневный `refresh_token' целиком. Тот же
+    %% класс, что закрытый issue 14 (заголовки), но через тело: маскируем
+    %% ЗНАЧЕНИЯ credential-ключей, сам lager:info сохранён.
+    lager:info("authorisze/1  req_data: ~p",[zkeycloak_util:redact_req_data(cb_context:req_data(Context))]),
     lager:info("authorisze/1  req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("authorisze/1  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("authorisze/1  req_nouns: ~p",[cb_context:req_nouns(Context)]),
@@ -74,7 +78,8 @@ authorize(Context) ->
 -spec authorize(cb_context:context(), kz_term:ne_binary()) -> boolean().
 authorize(Context, Token1) ->
     lager:info("authorisze/2 Token1: ~p",[Token1]),
-    lager:info("authorisze/2 req_data: ~p",[cb_context:req_data(Context)]),
+    %% issue 15: см. `authorize/1' — то же тело, тот же refresh_token.
+    lager:info("authorisze/2 req_data: ~p",[zkeycloak_util:redact_req_data(cb_context:req_data(Context))]),
     lager:info("authorisze/2 req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("authorisze/2 req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
     lager:info("authorisze/2 req_nouns: ~p",[cb_context:req_nouns(Context)]),
@@ -196,7 +201,10 @@ validate(Context, ?AUTH_CALLBACK) ->
             lager:info("validate_ext/2  TokenId: ~s",[zkeycloak_util:redact(TokenId)]),
             lager:info("validate_ext/2  TokenAccess: ~s",[zkeycloak_util:redact(TokenAccess)]),
             lager:info("validate_ext/2  TokenRefresh: ~s",[zkeycloak_util:redact(TokenRefresh)]),
-            lager:info("validate_ext/2  ClaimsMap: ~p",[ClaimsMap]),
+            %% issue 15: claim'ы id_token'а несут ПДн (email, ФИО, атрибуты
+            %% realm'а) — сырой `~p' клал их в plaintext-лог. Логируем
+            %% whitelist служебных полей + ИМЕНА остальных (`redacted_keys').
+            lager:info("validate_ext/2  ClaimsMap: ~p",[zkeycloak_util:claims_digest(ClaimsMap)]),
             lager:info("validate_ext/2  _Scope: ~p",[_Scope]),
             authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, 'login');
         %% issue 05: `retrieve_token/3' нормализован к {ok,_}|{error,_}. Битый/
@@ -291,8 +299,11 @@ validate(Context, ?ZKEYCLOAK) ->
 -spec zkeycloak_ext_post(cb_context:context()) -> cb_context:context().
 zkeycloak_ext_post(Context) ->
     ReqJSON = cb_context:req_json(Context),
-    lager:info("zkeycloak_ext_post/1 req_data: ~p",[cb_context:req_data(Context)]),
-    lager:info("zkeycloak_ext_post/1 req_json: ~p",[ReqJSON]),
+    %% issue 15: обе точки — сырое тело. `req_json' вдобавок печатает его
+    %% ВМЕСТЕ с crossbar-конвертом (`{"data":{…}}'), т.е. креды лежат вторым
+    %% уровнем — `redact_req_data/1' поэтому рекурсивна.
+    lager:info("zkeycloak_ext_post/1 req_data: ~p",[zkeycloak_util:redact_req_data(cb_context:req_data(Context))]),
+    lager:info("zkeycloak_ext_post/1 req_json: ~p",[zkeycloak_util:redact_req_data(ReqJSON)]),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, kz_json:new()), 'success').
 
 %% @doc Обмен refresh_token на KC и формирование Kazoo-сессии.
@@ -338,7 +349,12 @@ handle_refresh(Context, RefreshToken) ->
 authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mode) ->
     case zkeycloak_util:retrieve_userinfo(TokenTuple) of
         {'ok', UserInfoMap} ->
-            lager:info("authorize_and_issue[~p]  UserInfoMap: ~p", [Mode, UserInfoMap]),
+            %% issue 15: userinfo — основной носитель ПДн во всём флоу.
+            %% `claims_digest/1' сохраняет `resource_access' (роли), т.е.
+            %% диагностика role-гейта ниже и «молчаливого» отказа issue 13
+            %% по логу остаётся возможной.
+            lager:info("authorize_and_issue[~p]  UserInfoMap: ~p"
+                      ,[Mode, zkeycloak_util:claims_digest(UserInfoMap)]),
             %% KC-auth ревью (issue 13, backend): роль-гейт читает
             %% `resource_access.onbill_client.roles' из USERINFO, а не из
             %% access-токена. KC отдаёт `resource_access' в userinfo ТОЛЬКО
@@ -544,7 +560,12 @@ reject_user_provisioning(Context, 'login', _Reason) ->
 issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                  AccountId, OwnerId) ->
     UserInfoJObj = kz_json:from_map(UserInfoMap),
-    lager:info("provide_keycloak_token/5  UserInfoJObj: ~p",[UserInfoJObj]),
+    %% issue 15: `UserInfoJObj' — те же claim'ы, что и выше, только в
+    %% JObj-форме; сырой `~p' дублировал утечку ПДн. Логируем выжимку из
+    %% исходной мапы (она здесь в области видимости) — сам lager:info
+    %% сохранён, хотя содержательно эта строка дублирует `authorize_and_issue'.
+    lager:info("provide_keycloak_token/5  UserInfoJObj: ~p"
+              ,[zkeycloak_util:claims_digest(UserInfoMap)]),
     AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
     AccountName = kz_maps:get(<<"account_name">>, UserInfoMap, 'undefined'),
     JObj = kz_json:from_list(

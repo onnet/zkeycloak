@@ -29,6 +29,8 @@
         ,logout_url/1
         ,redact/1
         ,redact_headers/1
+        ,redact_req_data/1
+        ,claims_digest/1
         ]
        ).
 
@@ -43,6 +45,86 @@
                            ,<<"set-cookie">>
                            ,<<"x-auth-token">>
                            ]).
+
+%% @doc Ключи ТЕЛА запроса, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми.
+%% Список ground'ится по именам, реально ходящим через этот app (grep по
+%% коду), а не по догадкам:
+%%   `refresh_token'  — тело `POST /zkeycloak_ext/refresh' — ЖИВОЙ токен на
+%%                      ~30 дней (Offline Session Idle realm'а BRT);
+%%   `kc_refresh_token'/`kc_id_token' — те же токены в нашей же resp_data
+%%                      (`enrich_resp_with_kc_tokens/3'): клиент штатно
+%%                      получает их от нас и может прислать обратно;
+%%   `id_token_hint'  — сырой id_token (logout-флоу, `logout_url/1');
+%%   `code'/`code_verifier' — обменный материал (одноразовый, но до обмена
+%%                      валидный; тот же класс, что закрыл issue 01);
+%%   `password'       — `create_user/7' Props + форма `brt-unified' flow;
+%%   `client_secret'  — кред клиента `onbill_client' (config-ключ);
+%%   `access_token'/`id_token'/`auth_token' — канонические имена ровно того
+%%                      материала, которым оперирует модуль (`x-auth-token'
+%%                      по той же причине уже в ?SENSITIVE_HEADERS).
+%% `code_challenge' в списке НЕТ намеренно: он публичен по дизайну PKCE
+%% (см. комментарий `kerberos_auth_url/1'). См. `redact_req_data/1' (issue 15).
+-define(SENSITIVE_BODY_KEYS, [<<"refresh_token">>
+                             ,<<"kc_refresh_token">>
+                             ,<<"kc_id_token">>
+                             ,<<"id_token_hint">>
+                             ,<<"code">>
+                             ,<<"code_verifier">>
+                             ,<<"password">>
+                             ,<<"client_secret">>
+                             ,<<"access_token">>
+                             ,<<"id_token">>
+                             ,<<"auth_token">>
+                             ]).
+
+%% @doc Claim'ы KC (id_token / userinfo), значения которых МОЖНО писать в
+%% лог: служебные поля OIDC-флоу и гейтов этого модуля, к ПДн не относящиеся.
+%%
+%% Подход — БЕЛЫЙ список, а не поимённый redact чувствительных ключей:
+%% состав userinfo задаётся мапперами realm'а НА СТОРОНЕ KC, и новый
+%% ПДн-claim (телефон, отдел, СНИЛС…) не должен утекать в лог по умолчанию
+%% просто потому, что мы про него ещё не знали. Значения вне списка не
+%% печатаются никогда; печатаются только ИМЕНА (`redacted_keys' в
+%% `claims_digest/1') — имя claim'а это схема, а не данные, и по нему
+%% оператор видит, что KC начал отдавать новое поле. Имя в `redacted_keys'
+%% заодно работает presence-флагом («`family_name' пришёл?») — этого
+%% достаточно для штатной диагностики, значение для неё не нужно.
+%%
+%% Почему именно эти:
+%%   `sub'             — субъект = KIS owner_id, ключ корреляции всего флоу
+%%                       (и так логируется как `owner_id' в cb_zkeycloak_ext);
+%%   `iss'/`azp'/`aud' — realm/клиент: диагностика «токен не нашего issuer'а»;
+%%   `session_state'/`sid' — корреляция с session-логами самого KC;
+%%   `acr'/`amr'       — маркеры Kerberos vs password: `auth_method/1' читает
+%%                       ровно их, и `auth_method' уходит в auth-doc;
+%%   `exp'/`iat'/`auth_time'/`typ' — сроки жизни: диагностика `invalid_grant';
+%%   `scope'           — запрошен ли `offline_access' (без него KC не даст
+%%                       refresh — прямая причина поломки biometric-флоу);
+%%   `resource_access'/`realm_access' — РОЛИ: гейт `onbill_access'
+%%                       (`authorize_and_issue/6') читает их из userinfo, и
+%%                       штатный отказ «выключен маппер Add to userinfo →
+%%                       роли пусты → молча деним всех» (issue 13) без них
+%%                       не диагностируется в принципе;
+%%   `account_id'      — Kazoo-account из KazooAuth-claim'а (гейт issue 10).
+%% ПДн (`email', `preferred_username' (= логин, часто почта), `given_name',
+%% `family_name', `name', `phone_number', …) в список НЕ входят намеренно.
+-define(LOG_SAFE_CLAIMS, [<<"sub">>
+                         ,<<"iss">>
+                         ,<<"azp">>
+                         ,<<"aud">>
+                         ,<<"session_state">>
+                         ,<<"sid">>
+                         ,<<"acr">>
+                         ,<<"amr">>
+                         ,<<"exp">>
+                         ,<<"iat">>
+                         ,<<"auth_time">>
+                         ,<<"typ">>
+                         ,<<"scope">>
+                         ,<<"resource_access">>
+                         ,<<"realm_access">>
+                         ,<<"account_id">>
+                         ]).
 
 -define(MK_USER,
         {[{<<"enabled">>, 'true'}
@@ -411,22 +493,88 @@ redact_headers(Other) ->
 
 -spec redact_header_kv(term(), term()) -> term().
 redact_header_kv(Key, Value) ->
-    case is_sensitive_header(Key) of
+    case is_sensitive_key(Key, ?SENSITIVE_HEADERS) of
         'true' -> redact(Value);
         'false' -> Value
     end.
 
-%% @doc `Key' — имя заголовка (binary у cowboy, возможно atom/string в
-%% proplist-форме). Сравниваем в нижнем регистре: имена ASCII, поэтому
-%% `kz_term:to_lower_binary/1' не портит их (кириллицы в HTTP-именах нет),
-%% и результат используется только для membership-проверки — оригинальный
-%% ключ в выводе сохраняется как есть.
--spec is_sensitive_header(term()) -> boolean().
-is_sensitive_header(Key) when is_binary(Key);
-                              is_atom(Key);
-                              is_list(Key) ->
-    lists:member(kz_term:to_lower_binary(Key), ?SENSITIVE_HEADERS);
-is_sensitive_header(_Key) ->
+%% @doc Санитизация ТЕЛА запроса перед логированием: маскируем ЗНАЧЕНИЯ
+%% credential-ключей (?SENSITIVE_BODY_KEYS), структуру и остальные поля
+%% сохраняем — лог остаётся диагностически полезным. Тот же класс утечки,
+%% что закрыл `redact_headers/1' (issue 14), но через тело: сырой `~p' от
+%% `cb_context:req_data/1' в `authorize/1,2' клал в лог 30-дневный
+%% `refresh_token' целиком на каждом `POST /zkeycloak_ext/refresh'
+%% (issue 15). `lager'-вызовы НЕ удаляем — редактируем данные.
+%%
+%% Рекурсивно, и это обязательно: `zkeycloak_ext_post/1' логирует
+%% `cb_context:req_json/1' — тело ВМЕСТЕ с crossbar-конвертом
+%% (`{"data":{"refresh_token":…}}'), т.е. секрет лежит вторым уровнем.
+%% Внутрь JSON-массивов заходим по той же причине (объект в массиве).
+%%
+%% Не-объект (скаляр — напр. `{"data":"…"}' → req_data = binary) отдаём как
+%% есть: маскировать по ключу там нечего, а глушить любой скаляр убило бы
+%% лог целиком. Ни один из известных клиентов этого app'а скалярных тел с
+%% кредами не шлёт (все креды — именованные поля JSON-объекта).
+-spec redact_req_data(kz_json:object() | kz_json:json_term()) ->
+          kz_json:object() | kz_json:json_term().
+redact_req_data(Value) ->
+    case kz_json:is_json_object(Value) of
+        'true' -> kz_json:map(fun redact_req_data_kv/2, Value);
+        'false' -> redact_req_data_term(Value)
+    end.
+
+-spec redact_req_data_kv(kz_json:key(), kz_json:json_term()) ->
+          {kz_json:key(), kz_json:json_term()}.
+redact_req_data_kv(Key, Value) ->
+    case is_sensitive_key(Key, ?SENSITIVE_BODY_KEYS) of
+        'true' -> {Key, redact(Value)};
+        'false' -> {Key, redact_req_data(Value)}
+    end.
+
+%% @doc Не-объектный JSON-терм: массив обходим поэлементно (в нём могут
+%% лежать объекты с кредами), скаляр возвращаем как есть. kz_json-объект
+%% сюда не попадает — он tuple (`?JSON_WRAPPER'), его снял `is_json_object/1'.
+-spec redact_req_data_term(kz_json:json_term()) -> kz_json:json_term().
+redact_req_data_term(Values) when is_list(Values) ->
+    [redact_req_data(V) || V <- Values];
+redact_req_data_term(Value) ->
+    Value.
+
+%% @doc Log-safe выжимка claim'ов KC (`ClaimsMap' id_token'а, `UserInfoMap'
+%% userinfo-ответа): значения ТОЛЬКО служебных полей (?LOG_SAFE_CLAIMS),
+%% от остальных — одни имена в `redacted_keys'. Сырой `~p' этих мап клал в
+%% plaintext-лог ПДн пользователя (email, ФИО, атрибуты realm'а) на каждом
+%% логине (issue 15). Обоснование состава и выбора «whitelist, а не
+%% denylist» — в комментарии к ?LOG_SAFE_CLAIMS.
+%%
+%% `redacted_keys' — атом-ключ намеренно: все claim'ы KC приходят с
+%% binary-ключами, так что наше синтетическое поле с ними не столкнётся.
+%%
+%% Неожиданная форма (не map) — fail-CLOSED: печатаем только факт, не
+%% содержимое. Это сознательно строже, чем fail-open в `redact_headers/1':
+%% там имена полей известны и конечны, здесь состав задаёт realm KC, и
+%% неизвестная форма может целиком состоять из ПДн.
+-spec claims_digest(any()) -> map().
+claims_digest(Claims) when is_map(Claims) ->
+    Safe = maps:with(?LOG_SAFE_CLAIMS, Claims),
+    Redacted = maps:keys(maps:without(?LOG_SAFE_CLAIMS, Claims)),
+    Safe#{'redacted_keys' => lists:sort(Redacted)};
+claims_digest(_Other) ->
+    #{'unexpected_claims_shape' => 'true'}.
+
+%% @doc Совпало ли `Key' с одним из чувствительных имён `Names'. `Key' —
+%% имя заголовка или ключ JSON-тела (binary у cowboy/kz_json, возможно
+%% atom/string в исторической proplist-форме). Сравниваем в нижнем
+%% регистре: имена ASCII, поэтому `kz_term:to_lower_binary/1' их не портит
+%% (кириллицы в HTTP-именах и OIDC-ключах нет), и результат используется
+%% ТОЛЬКО для membership-проверки — оригинальный ключ в выводе сохраняется
+%% как есть, даже если бы to_lower его исказил.
+-spec is_sensitive_key(term(), [kz_term:ne_binary()]) -> boolean().
+is_sensitive_key(Key, Names) when is_binary(Key);
+                                  is_atom(Key);
+                                  is_list(Key) ->
+    lists:member(kz_term:to_lower_binary(Key), Names);
+is_sensitive_key(_Key, _Names) ->
     'false'.
 
 %% @doc Санитайзер oidcc-результата refresh для лога: сохраняем структуру
@@ -445,6 +593,27 @@ redact_token_result({'ok', {'oidcc_token'
 redact_token_result(Other) ->
     kz_term:to_binary(io_lib:format("~p", [Other])).
 
+%% @doc Присутствует ли поле — для presence-логов вместо значений-ПДн
+%% (`create_user/7', issue 15). `undefined'/пусто = отсутствует.
+-spec is_present(any()) -> boolean().
+is_present('undefined') -> 'false';
+is_present(<<>>) -> 'false';
+is_present(_Value) -> 'true'.
+
+%% @doc Санитайзер результата сохранения user-doc'а для лога: `{ok, Doc}'
+%% схлопываем до факта + `_id' (сам Doc — ПДн + pvt-хеши, issue 15);
+%% `{error, _}' отдаём как есть — там причина датастора, не ПДн. Catch-all
+%% делает хелпер fail-safe на неожиданной форме, как `redact_token_result/1'.
+-spec redact_user_doc_result(any()) -> kz_term:ne_binary().
+redact_user_doc_result({'ok', Doc}) ->
+    Id = case kz_json:is_json_object(Doc) of
+             'true' -> kz_json:get_ne_binary_value(<<"_id">>, Doc);
+             'false' -> 'undefined'
+         end,
+    <<"{ok,doc_id=", (kz_term:to_binary(Id))/binary, "}">>;
+redact_user_doc_result(Other) ->
+    kz_term:to_binary(io_lib:format("~p", [Other])).
+
 -spec create_user(kz_term:ne_binary()
                  ,kz_term:ne_binary()
                  ,kz_term:api_ne_binary()
@@ -458,10 +627,20 @@ redact_token_result(Other) ->
                               | term()}
                     | kz_datamgr:data_error().
 create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPassword) ->
-    lager:info("create_user AccountId: ~p, UserDocId: ~p, Email: ~p",[AccountId,UserDocId,Email]),
-    lager:info("create_user Firstname: ~p",[Firstname]),
-    lager:info("create_user Surname: ~p",[Surname]),
-    lager:info("create_user Phonenumber: ~p",[Phonenumber]),
+    %% issue 15: `Email'/`Firstname'/`Surname'/`Phonenumber' — ПДн, приехавшие
+    %% из userinfo KC (`cb_zkeycloak_ext:ensure_user_doc/4' достаёт их из
+    %% claim'ов), и сырой `~p' клал их в plaintext-лог на первом логине
+    %% КАЖДОГО пользователя. Логируем НАЛИЧИЕ полей вместо значений —
+    %% диагностическая ценность сохраняется полностью: штатный сбой здесь это
+    %% ровно «у LDAP-юзера пустой `sn' → нет `last_name' → validation_errors»,
+    %% и `has_surname=false' говорит об этом прямее, чем сам ФИО. `AccountId'/
+    %% `UserDocId' — внутренние id, не ПДн: оставляем как есть (по ним всё и
+    %% коррелируется). Сами `lager:info' сохранены — правило проекта.
+    lager:info("create_user AccountId: ~p, UserDocId: ~p, has_email: ~p"
+              ,[AccountId, UserDocId, is_present(Email)]),
+    lager:info("create_user has_firstname: ~p",[is_present(Firstname)]),
+    lager:info("create_user has_surname: ~p",[is_present(Surname)]),
+    lager:info("create_user has_phonenumber: ~p",[is_present(Phonenumber)]),
     Props = props:filter_empty([{<<"username">>, Email}
                                ,{<<"first_name">>, Firstname}
                                ,{<<"last_name">>, Surname}
@@ -488,7 +667,11 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
                             ,{'ensure_saved', 'true'}
                             ],
             Result = kz_datamgr:update_doc(DbName, UserDocId, UpdateOptions),
-            lager:info("create_user Result: ~p", [Result]),
+            %% issue 15: на успехе `Result' = `{ok, <сохранённый user-doc>}', а
+            %% он несёт и ПДн (`first_name'/`last_name'/`email'/`username' из
+            %% claim'ов), и pvt-хеши пароля — сырой `~p' = та же утечка, что
+            %% claims. Печатаем факт + id документа.
+            lager:info("create_user Result: ~s", [redact_user_doc_result(Result)]),
             Result;
         {'validation_errors', _} = Err ->
             lager:info("create_user Err: ~p", [Err]),
