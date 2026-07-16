@@ -379,9 +379,32 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                             ,kz_term:ne_binary()
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode, OwnerId) ->
-    AccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
-    DbName = kzs_util:format_account_id(AccountId, 'encoded'),
+    %% issue 10: claim `account_id' ставит только SPI-путь handleKazooAuth;
+    %% userinfo без него (LDAP/federated) раньше уезжал undefined'ом в
+    %% format_account_id/open_doc/create_user — грязный сбой вместо 401.
+    case kz_maps:get(<<"account_id">>, UserInfoMap) of
+        'undefined' ->
+            lager:info("provide_keycloak_token[~p]: userinfo has no account_id claim"
+                       " owner_id=~s (non-KazooAuth subject?) — rejecting", [Mode, OwnerId]),
+            cb_context:add_system_error('invalid_credentials', Context);
+        AccountId ->
+            DbName = kzs_util:format_account_id(AccountId, 'encoded'),
+            provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh,
+                                   UserInfoMap, Mode, OwnerId, AccountId, DbName)
+    end.
 
+-spec provide_keycloak_token(cb_context:context()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,map()
+                            ,'login' | 'refresh'
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ) -> cb_context:context().
+provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
+                       Mode, OwnerId, AccountId, DbName) ->
     case check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap) of
         'ok' ->
             issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
