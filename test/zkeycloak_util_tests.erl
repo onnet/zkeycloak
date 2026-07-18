@@ -520,6 +520,21 @@ redact_reason_masks_oidcc_http_error_body_test() ->
     ?assertNotEqual('nomatch', binary:match(Fmt, <<"401">>)),
     ?assertMatch({'error', {'http_error', 401, '$redacted'}}, R).
 
+redact_reason_masks_oidcc_invalid_property_token_test() ->
+    %% P2 (волна 2): oidcc `{invalid_property, {Field, GivenValue}}' — для
+    %% access_token/refresh_token/id_token `GivenValue' = сырой токен-материал
+    %% (oidcc_token.erl:797/809/834). Имя поля — схема, значение — секрет.
+    Err = {'error', {'invalid_property', {'refresh_token', <<"raw-live-refresh-LIVE-SECRET">>}}},
+    R = zkeycloak_util:redact_reason(Err),
+    Fmt = ?FMT(R),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"LIVE-SECRET">>)),
+    %% имя поля осталось диагностикой
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"refresh_token">>)),
+    ?assertMatch({'error', {'invalid_property', {'refresh_token', _}}}, R),
+    %% не-binary GivenValue (напр. scopes-список) → непрозрачный сентинел
+    ?assertEqual({'invalid_property', {'scopes', '$redacted'}}
+                ,zkeycloak_util:redact_reason({'invalid_property', {'scopes', [<<"a">>, <<"b">>]}})).
+
 redact_reason_passthrough_atoms_and_tags_test() ->
     %% Диагностика без встроенного значения выживает как есть. `function_clause'
     %% — голый атом (аргументы только в стеке, а он редактируется отдельно),

@@ -867,6 +867,16 @@ redact_reason({'http_error', Code, _ErrBody}) ->
     %% стороны. Редакт по форме, не по доказанному содержимому; `Code' —
     %% диагностика, оставляем.
     {'http_error', Code, '$redacted'};
+redact_reason({'invalid_property', {Field, GivenValue}}) ->
+    %% P2 (кросс-ревью 18.07 волна 2): штатный `error()'-протокол oidcc —
+    %% `oidcc_token' отдаёт `{invalid_property, {Field, GivenValue}}'
+    %% (`oidcc_token.erl:249-251'), и для `Field' ∈ {access_token,
+    %% refresh_token, id_token} `GivenValue' это СЫРОЙ токен-материал
+    %% server-controlled формы (`:797/:809/:834'). `Field'
+    %% (id_token/refresh_token/access_token/expires_in/scopes) — публичная
+    %% схема, оставляем; `GivenValue' режем по форме (binary → префикс+длина,
+    %% иначе сентинел) тем же редактором, что badmatch/none_alg_used.
+    {'invalid_property', {Field, redact_reason_value(GivenValue)}};
 redact_reason({Class, Reason}) when Class =:= 'error';
                                     Class =:= 'exit';
                                     Class =:= 'throw' ->
