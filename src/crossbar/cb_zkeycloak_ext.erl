@@ -452,17 +452,49 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
     %% формат — единственную форму, которую `format_account_id/2` не роняет и
     %% которую реально шлёт SPI. Всё прочее (`undefined'/`<<>>'/малформ) →
     %% чистый 401 `invalid_credentials' (образец `a1eae36').
-    case kz_maps:get(<<"account_id">>, UserInfoMap) of
-        ?MATCH_ACCOUNT_RAW(AccountId) ->
-            DbName = kzs_util:format_account_id(AccountId, 'encoded'),
+    RawAccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
+    case is_raw_account_id(RawAccountId) of
+        'true' ->
+            DbName = kzs_util:format_account_id(RawAccountId, 'encoded'),
             provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh,
-                                   UserInfoMap, Mode, OwnerId, AccountId, DbName);
-        Other ->
+                                   UserInfoMap, Mode, OwnerId, RawAccountId, DbName);
+        'false' ->
+            %% P3 (кросс-ревью 18.07 волна 2): единый reject-путь.
+            %% (1) `RawAccountId' печатался сырым `~p' — при misconfig маппера
+            %%     KC (email/ФИО в claim'е account_id) в лог уходили ПДн;
+            %%     логируем факт+длину через `zkeycloak_util:redact/1'.
+            %% (2) `?MATCH_ACCOUNT_RAW' раньше матчил ЛЮБЫЕ 32 байта — 32-
+            %%     байтный не-hex проходил гейт, а `format_account_id/2' давал
+            %%     корректный по форме, но несуществующий db-путь → downstream
+            %%     503 вместо чистого 401. Реальный account_id из SPI-claim'а
+            %%     всегда 32 hex; `is_raw_account_id/1' добавляет проверку
+            %%     алфавита → не-hex отвергается здесь же, до БД.
             lager:info("provide_keycloak_token[~p]: userinfo account_id absent or"
-                       " malformed (~p) owner_id=~s (non-KazooAuth subject?) — rejecting",
-                       [Mode, Other, OwnerId]),
+                       " malformed (~s) owner_id=~s (non-KazooAuth subject?) — rejecting",
+                       [Mode, zkeycloak_util:redact(RawAccountId), OwnerId]),
             cb_context:add_system_error('invalid_credentials', Context)
     end.
+
+%% @doc raw-account-id это ровно 32 hex-байта — единственная форма, которую
+%% (а) реально шлёт SPI-claim `handleKazooAuth' и (б) `kzs_util:format_account_id/2'
+%% превращает в СУЩЕСТВУЮЩИЙ db-путь. `?MATCH_ACCOUNT_RAW' проверяет только
+%% ДЛИНУ (32 байта) — 32-байтный не-hex прошёл бы её и упал бы 503 ниже;
+%% hex-предикат добавляет недостающую проверку алфавита (P3 кросс-ревью 18.07
+%% волна 2). Не-binary / не-32-байтные формы (`undefined'/`<<>>'/малформ) →
+%% `false' → чистый 401 (сохраняет поведение issue 10 / P3-2).
+-spec is_raw_account_id(any()) -> boolean().
+is_raw_account_id(?MATCH_ACCOUNT_RAW(AccountId)) -> is_hex(AccountId);
+is_raw_account_id(_) -> 'false'.
+
+-spec is_hex(binary()) -> boolean().
+is_hex(B) ->
+    lists:all(fun is_hex_char/1, binary_to_list(B)).
+
+-spec is_hex_char(byte()) -> boolean().
+is_hex_char(C) when C >= $0, C =< $9 -> 'true';
+is_hex_char(C) when C >= $a, C =< $f -> 'true';
+is_hex_char(C) when C >= $A, C =< $F -> 'true';
+is_hex_char(_) -> 'false'.
 
 -spec provide_keycloak_token(cb_context:context()
                             ,kz_term:ne_binary()

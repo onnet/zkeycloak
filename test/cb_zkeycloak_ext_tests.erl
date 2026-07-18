@@ -74,6 +74,16 @@ account_gate_rejects_malformed_test() ->
             cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'refresh', ?OWNER_ID),
     assert_401(Ctx).
 
+account_gate_rejects_32byte_non_hex_test() ->
+    %% P3 (волна 2): ровно 32 байта, но не hex. `?MATCH_ACCOUNT_RAW' матчит
+    %% любые 32 байта → раньше проходил гейт, `format_account_id/2' давал путь
+    %% к несуществующей БД → downstream 503 вместо чистого 401. hex-гейт
+    %% отклоняет до БД.
+    UserInfo = #{<<"account_id">> => binary:copy(<<"z">>, 32)},
+    Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+            cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login', ?OWNER_ID),
+    assert_401(Ctx).
+
 %%%=============================================================================
 %%% Валидный login-флоу через оба гейта (границы замоканы)
 %%%=============================================================================
