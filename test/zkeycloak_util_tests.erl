@@ -487,6 +487,20 @@ redact_reason_masks_oidcc_none_alg_used_test() ->
            {'none_alg_used', <<"raw.jwt.LIVE-SECRET-payload">>, {'jose_jws', #{}}}),
     ?assertEqual('nomatch', binary:match(?FMT(R3), <<"LIVE-SECRET">>)).
 
+redact_reason_masks_oidcc_http_error_body_test() ->
+    %% P2: `{http_error, Code, ErrBody}' — `ErrBody' (binary|map) это тело
+    %% HTTP-ответа KC (token/userinfo/jwks), server-controlled и без схемы:
+    %% реконфиг realm / апгрейд KC / прокси-страница могут положить туда что
+    %% угодно. Режем по форме; статус-код оставляем диагностикой.
+    Err = {'error', {'http_error', 401
+                    ,#{<<"error_description">> => <<"user secret LIVE-SECRET leaked">>}}},
+    R = zkeycloak_util:redact_reason(Err),
+    Fmt = ?FMT(R),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"LIVE-SECRET">>)),
+    %% статус-код на месте — диагностика жива
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"401">>)),
+    ?assertMatch({'error', {'http_error', 401, '$redacted'}}, R).
+
 redact_reason_passthrough_atoms_and_tags_test() ->
     %% Диагностика без встроенного значения выживает как есть. `function_clause'
     %% — голый атом (аргументы только в стеке, а он редактируется отдельно),

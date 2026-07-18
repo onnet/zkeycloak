@@ -817,7 +817,9 @@ redact_stack_frame(Frame) ->
 %%      `{missing_claim, Claim, Claims}' — 3-й элемент это ПОЛНАЯ декодированная
 %%      claims-map (рутинные nonce/aud/exp-провалы; `oidcc_token'/`oidcc_jwt_util'/
 %%      `oidcc_userinfo'); `{none_alg_used, TokenRecord|Claims}' и
-%%      `{none_alg_used, Jwt, Jws}' — token-record / claims / сырой JWT.
+%%      `{none_alg_used, Jwt, Jws}' — token-record / claims / сырой JWT;
+%%      `{http_error, Code, ErrBody}' — `ErrBody' (`binary()|map()') это
+%%      сырое/распарсенное тело HTTP-ответа KC (server-controlled, без схемы).
 %%
 %% Сохраняем ТЕГ краша и полезную диагностику (имя клейма `Claim' — публичная
 %% схема, не ПДн), но вычищаем встроенное значение: binary → `redact/1'
@@ -847,6 +849,14 @@ redact_reason({'none_alg_used', Value}) ->
 redact_reason({'none_alg_used', Jwt, Jws}) ->
     %% сырой JWT + JWS во фрейме валидации alg=none.
     {'none_alg_used', redact_reason_value(Jwt), redact_reason_value(Jws)};
+redact_reason({'http_error', Code, _ErrBody}) ->
+    %% P2: `ErrBody' (`binary()|map()', `oidcc_http_util') — сырое/распарсенное
+    %% тело HTTP-ответа KC (token/userinfo/jwks; всплывает на рутинных
+    %% invalid_grant), server-controlled и без схемы: реконфиг realm / апгрейд
+    %% KC / прокси-страница могут поменять содержимое без правок с нашей
+    %% стороны. Редакт по форме, не по доказанному содержимому; `Code' —
+    %% диагностика, оставляем.
+    {'http_error', Code, '$redacted'};
 redact_reason({Class, Reason}) when Class =:= 'error';
                                     Class =:= 'exit';
                                     Class =:= 'throw' ->
