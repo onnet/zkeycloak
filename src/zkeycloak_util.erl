@@ -730,6 +730,16 @@ redact_token_result({'ok', {'oidcc_token'
      ," refresh=", (redact(Refresh))/binary, "}">>;
 redact_token_result({'ok', _Unrecognized}) ->
     <<"{ok,<unrecognized oidcc_token shape — redacted>}">>;
+redact_token_result({'error', Reason}) ->
+    %% P1 (кросс-ревью 18.07 волна 2): `refresh_token/1' логирует ВЕСЬ Result
+    %% через этот хелпер (line 497) ДО case-разбора, а на refresh-пути oidcc
+    %% ШТАТНО отдаёт `{error, {http_error, 400, <тело ответа KC>}}' (ежедневный
+    %% invalid_grant у mobile) и `{error, {missing_claim, _, <claims-map>}}' —
+    %% оба уезжали в общий `~p'-catch-all этой функции СЫРЫМИ (тело HTTP-ответа
+    %% KC / ПДн из claims). Тот же класс утечки, что закрыт `redact_reason/1'
+    %% на других call-site'ах (996399b/8d052e8): чистим встроенное в `Reason'
+    %% значение, тег/код ошибки оставляем диагностикой.
+    kz_term:to_binary(io_lib:format("~p", [{'error', redact_reason(Reason)}]));
 redact_token_result(Other) ->
     kz_term:to_binary(io_lib:format("~p", [Other])).
 

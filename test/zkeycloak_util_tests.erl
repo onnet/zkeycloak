@@ -428,6 +428,25 @@ redact_token_result_unrecognized_ok_fails_closed_test() ->
     ?assertEqual('nomatch', binary:match(R, <<"live-access-token-payload">>)),
     ?assertEqual('nomatch', binary:match(R, <<"live-refresh-token-payload">>)).
 
+redact_token_result_error_reason_masked_test() ->
+    %% P1 (волна 2): `refresh_token/1' логирует ВЕСЬ Result через этот хелпер
+    %% ДО case; на refresh-пути oidcc штатно отдаёт `{error,{http_error,_,Body}}'
+    %% (invalid_grant у mobile) и `{error,{missing_claim,_,Claims}}' — оба
+    %% раньше уходили в `~p'-catch-all СЫРЫМИ. Теперь чистятся через redact_reason.
+    HttpErr = {'error', {'http_error', 400
+                        ,#{<<"error_description">> => <<"invalid_grant LIVE-SECRET">>}}},
+    RH = zkeycloak_util:redact_token_result(HttpErr),
+    ?assertEqual('nomatch', binary:match(RH, <<"LIVE-SECRET">>)),
+    %% статус-код диагностики сохранён
+    ?assertNotEqual('nomatch', binary:match(RH, <<"400">>)),
+    %% missing_claim с полной claims-map — ПДн (email/ФИО) не утекают
+    ClaimsMap = maps:put(<<"nonce">>, <<"expected-nonce">>, userinfo()),
+    RC = zkeycloak_util:redact_token_result({'error', {'missing_claim', <<"nonce">>, ClaimsMap}}),
+    ?assertEqual('nomatch', binary:match(RC, ?EMAIL)),
+    ?assertEqual('nomatch', binary:match(RC, <<"Иван"/utf8>>)),
+    %% имя клейма — публичная схема — остаётся диагностикой
+    ?assertNotEqual('nomatch', binary:match(RC, <<"nonce">>)).
+
 %%%=============================================================================
 %%% redact_reason/1 (P3 кросс-ревью 18.07) — значение, встроенное в Reason
 %%%=============================================================================
