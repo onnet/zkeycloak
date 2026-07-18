@@ -212,10 +212,17 @@ validate(Context, ?AUTH_CALLBACK) ->
         %% cancel→retry на MIUI — issue 06) или KC-недоступность → чистый 401
         %% `invalid_credentials' вместо прежнего badmatch-500.
         {'error', Reason} ->
-            lager:info("validate_ext/2  auth_callback: token exchange failed ~p", [Reason]),
+            %% P3 (кросс-ревью 18.07): `Reason' из retrieve_token/3 может нести
+            %% встроенное в `{badmatch,V}'/… значение (claim-байты) — чистим.
+            lager:info("validate_ext/2  auth_callback: token exchange failed ~p"
+                      ,[zkeycloak_util:redact_reason(Reason)]),
             cb_context:add_system_error('invalid_credentials', Context);
         Other ->
-            lager:info("validate_ext/2  auth_callback: unexpected token result ~p", [Other]),
+            %% P3 (кросс-ревью 18.07): `Other' здесь — `{ok,<нестандартная
+            %% форма>}' (retrieve_token нормализован к {ok,_}|{error,_}), т.е.
+            %% дрейф формы токена с потенциально ЖИВЫМИ токенами внутри.
+            lager:info("validate_ext/2  auth_callback: unexpected token result ~s"
+                      ,[zkeycloak_util:redact_token_result(Other)]),
             cb_context:add_system_error('invalid_credentials', Context)
     end;
 validate(Context, ?KERBEROS_LOGIN) ->
@@ -326,10 +333,16 @@ handle_refresh(Context, RefreshToken) ->
             authorize_and_issue(Context, TokenTuple, NewTokenAccess, NewTokenId,
                                 NewTokenRefresh, 'refresh');
         {'error', Reason} ->
-            lager:info("handle_refresh: KC error ~p — invalid_grant flow", [Reason]),
+            %% P3 (кросс-ревью 18.07): тот же класс, что auth_callback —
+            %% `Reason' из refresh_token/1 чистим (встроенное значение краша).
+            lager:info("handle_refresh: KC error ~p — invalid_grant flow"
+                      ,[zkeycloak_util:redact_reason(Reason)]),
             cb_context:add_system_error('invalid_credentials', Context);
         Other ->
-            lager:info("handle_refresh: unexpected oidcc result ~p", [Other]),
+            %% P3 (кросс-ревью 18.07): `Other' — `{ok,<нестандартная форма>}'
+            %% (refresh_token нормализован), дрейф формы с живыми токенами.
+            lager:info("handle_refresh: unexpected oidcc result ~s"
+                      ,[zkeycloak_util:redact_token_result(Other)]),
             cb_context:add_system_error('invalid_credentials', Context)
     end.
 

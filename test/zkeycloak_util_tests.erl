@@ -427,3 +427,45 @@ redact_token_result_unrecognized_ok_fails_closed_test() ->
     R = zkeycloak_util:redact_token_result(Live),
     ?assertEqual('nomatch', binary:match(R, <<"live-access-token-payload">>)),
     ?assertEqual('nomatch', binary:match(R, <<"live-refresh-token-payload">>)).
+
+%%%=============================================================================
+%%% redact_reason/1 (P3 кросс-ревью 18.07) — значение, встроенное в Reason
+%%%=============================================================================
+
+redact_reason_masks_binary_in_badmatch_test() ->
+    %% Асимметрия защиты: stack чистился, а `Reason' — нет. `error:{badmatch,V}'
+    %% на декодированных claim-байтах / token-материале уводил `V' в лог сырым
+    %% через catch-блоки normalize_oidcc/2 и refresh_token/1.
+    Reason = {'badmatch', <<"eyJhbGci-decoded-claim-bytes-LIVE-SECRET">>},
+    Fmt = ?FMT(zkeycloak_util:redact_reason(Reason)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"LIVE-SECRET">>)),
+    %% тег краша сохранён — сбой остаётся диагностируемым
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"badmatch">>)).
+
+redact_reason_masks_case_clause_and_badmap_test() ->
+    %% case_clause / badmap — тот же класс: значение встроено прямо в Reason.
+    %% Не-binary форму (map claim'ов) заменяем непрозрачным сентинелом.
+    Claims = #{<<"email">> => ?EMAIL, <<"sub">> => ?SUB},
+    ?assertEqual({'case_clause', '$redacted'}
+                ,zkeycloak_util:redact_reason({'case_clause', Claims})),
+    ?assertEqual({'badmap', '$redacted'}
+                ,zkeycloak_util:redact_reason({'badmap', Claims})),
+    ?assertEqual('nomatch'
+                ,binary:match(?FMT(zkeycloak_util:redact_reason({'case_clause', Claims}))
+                             ,?EMAIL)).
+
+redact_reason_passthrough_atoms_and_tags_test() ->
+    %% Диагностика без встроенного значения выживает как есть.
+    ?assertEqual('function_clause', zkeycloak_util:redact_reason('function_clause')),
+    ?assertEqual('badarg', zkeycloak_util:redact_reason('badarg')),
+    ?assertEqual({'missing_user_doc_on_refresh', {'error', 'not_found'}}
+                ,zkeycloak_util:redact_reason(
+                   {'missing_user_doc_on_refresh', {'error', 'not_found'}})).
+
+redact_reason_recurses_into_class_reason_pair_test() ->
+    %% Проброшенный catch-контракт `{Class, Reason}' — встроенное значение
+    %% чистится и внутри пары (эта форма доезжает до лога cb_zkeycloak_ext).
+    Reason = {'error', {'badmatch', <<"token-bytes-LIVE-SECRET">>}},
+    R = zkeycloak_util:redact_reason(Reason),
+    ?assertEqual('nomatch', binary:match(?FMT(R), <<"LIVE-SECRET">>)),
+    ?assertMatch({'error', {'badmatch', _}}, R).

@@ -32,6 +32,8 @@
         ,redact_req_data/1
         ,claims_digest/1
         ,redact_provisioning_error/1
+        ,redact_reason/1
+        ,redact_token_result/1
         ]
        ).
 
@@ -43,7 +45,6 @@
         ,redact_validation_errors/1
         ,redact_crash/1
         ,redact_stack/1
-        ,redact_token_result/1
         ,jwt_sub_unverified/1
         ]).
 -endif.
@@ -409,20 +410,36 @@ normalize_oidcc(Tag, Fun) ->
     try Fun() of
         {'ok', _} = Ok -> Ok;
         {'error', _} = Err ->
-            lager:info("zkeycloak ~s oidcc error: ~p", [Tag, Err]),
+            %% P3 (кросс-ревью 18.07): `Reason' oidcc-ошибки печатался сырым —
+            %% редактируем встроенное в него значение (redact_reason/1 —
+            %% no-op для протокольных ошибок, но чистит `{badmatch,V}' и пр.).
+            lager:info("zkeycloak ~s oidcc error: ~p", [Tag, redact_reason(Err)]),
             Err;
         Other ->
-            lager:warning("zkeycloak ~s unexpected oidcc result: ~p", [Tag, Other]),
-            {'error', {'unexpected_oidcc_result', Other}}
+            %% P3 (кросс-ревью 18.07): неузнанная форма oidcc-результата
+            %% печаталась сырой — fail-open дрейф формы токена (если это
+            %% `{ok,<token>}' с ЖИВЫМИ токенами, `~p' их бы слил; для
+            %% refresh_token тот же класс уже закрыт через redact_token_result).
+            %% Логируем и ПРОБРАСЫВАЕМ санитизированную форму, чтобы она не
+            %% доехала сырой до `cb_zkeycloak_ext' (`~p' от Reason там).
+            RedactedOther = redact_token_result(Other),
+            lager:warning("zkeycloak ~s unexpected oidcc result: ~s", [Tag, RedactedOther]),
+            {'error', {'unexpected_oidcc_result', RedactedOther}}
     catch
         Class:Reason:Stack ->
             %% issue 15 (review-loop): `Stack' печатался сырым, а обёрнутые
             %% тут вызовы — `oidcc:retrieve_token(AuthCode, _, ClientId,
             %% ClientSecret, _)' и пр., т.е. фрейм с аргументами несёт и
             %% `code', и `client_secret()'. Печатаем M:F/A без args.
+            %% P3 (кросс-ревью 18.07): `Reason' тоже печатался сырым, а
+            %% `error:{badmatch,V}'/`{case_clause,V}'/`{badmap,M}' встраивают
+            %% значение (декодированные claim-байты из `jwt_sub_unverified/1'
+            %% и т.п.). Чистим `Reason' И в логе, И в проброшенном наверх
+            %% `{Class, Reason}' (тот доезжает до лога `cb_zkeycloak_ext').
+            RedactedReason = redact_reason(Reason),
             lager:warning("zkeycloak ~s exception ~p:~p stack=~p",
-                          [Tag, Class, Reason, redact_stack(Stack)]),
-            {'error', {Class, Reason}}
+                          [Tag, Class, RedactedReason, redact_stack(Stack)]),
+            {'error', {Class, RedactedReason}}
     end.
 
 %% @doc Обмен refresh_token → новый набор токенов (access + refresh + id_token).
@@ -481,7 +498,11 @@ refresh_token(RefreshToken) ->
         case Result of
             {'ok', _} -> Result;
             {'error', _} -> Result;
-            Other -> {'error', {'unexpected_oidcc_result', Other}}
+            %% P3 (кросс-ревью 18.07): пробрасываем санитизированную форму —
+            %% дрейфнувший `{ok,<token>}' не должен доехать сырым до
+            %% `cb_zkeycloak_ext:handle_refresh' (там `~p' от Other). Result
+            %% в лог уже ушёл выше через redact_token_result.
+            Other -> {'error', {'unexpected_oidcc_result', redact_token_result(Other)}}
         end
     catch
         Class:Reason:Stack ->
@@ -489,9 +510,13 @@ refresh_token(RefreshToken) ->
             %% refresh_token(RefreshToken, …, ClientSecret, …)' лежат живой
             %% refresh и client_secret; `base64:decode/2' (BIF-badarg в
             %% `jwt_sub_unverified/1') кладёт во фрейм payload-сегмент JWT.
+            %% P3 (кросс-ревью 18.07): `Reason' тоже — `error:{badmatch,V}' и
+            %% пр. встраивают несовпавшее значение (payload/claim-байты).
+            %% Чистим `Reason' в логе И в проброшенном `{Class, Reason}'.
+            RedactedReason = redact_reason(Reason),
             lager:warning("zkeycloak refresh_token exception ~p:~p stack=~p",
-                          [Class, Reason, redact_stack(Stack)]),
-            {'error', {Class, Reason}}
+                          [Class, RedactedReason, redact_stack(Stack)]),
+            {'error', {Class, RedactedReason}}
     end.
 
 %% @doc Маскирование bearer-кред (access/refresh/id token, code_verifier,
@@ -688,6 +713,11 @@ is_sensitive_key(_Key, _Names) ->
 %% но молча и без теста. Печатаем сентинел: на такой строке в логе видно, что
 %% форма разъехалась, а токены не утекают. `{error,_}'/прочее печатаем как
 %% есть — там причина отказа KC, не креды.
+%%
+%% Экспортируется в прод-API (P3 кросс-ревью 18.07): помимо `refresh_token/1'
+%% и `normalize_oidcc/2' его теперь зовёт `cb_zkeycloak_ext' на своих
+%% `Other'-клозах (`validate(?AUTH_CALLBACK)'/`handle_refresh'), где `Other' —
+%% это `{ok,<нестандартная форма>}', т.е. тот же fail-open дрейф с живыми токенами.
 -spec redact_token_result(any()) -> kz_term:ne_binary().
 redact_token_result({'ok', {'oidcc_token'
                            ,{'oidcc_token_id', Id, _Claims}
@@ -771,6 +801,49 @@ redact_stack_frame({M, F, Args, Loc}) when is_list(Args) ->
     {M, F, length(Args), Loc};
 redact_stack_frame(Frame) ->
     Frame.
+
+%% @doc Санитайзер `Reason' исключения перед тем, как он попадёт в лог-строку
+%% ИЛИ в проброшенный наверх `{Class, Reason}' (а оттуда — в лог
+%% `cb_zkeycloak_ext'). `redact_stack/1' уже чистит АРГУМЕНТЫ фреймов, но сам
+%% `Reason' печатался сырым — асимметрия защиты (P3-находка кросс-ревью 18.07):
+%% `error:{badmatch,V}'/`{case_clause,V}'/`{badmap,M}' ВСТРАИВАЮТ несовпавшее
+%% значение прямо в `Reason'. В этом модуле таким значением бывают
+%% декодированные байты claim'ов (`jwt_sub_unverified/1': `base64:decode' →
+%% `kz_json:decode' payload'а JWT) или token-материал.
+%%
+%% Сохраняем ТЕГ краша (диагностика — какого класса сбой), но вычищаем
+%% значение: binary → `redact/1' (префикс+длина, тот же класс секрета, что
+%% токены), любую другую форму (map claim'ов, JSON-объект, список) → непрозрачный
+%% сентинел `'$redacted''. Атомы без встроенного значения (`function_clause',
+%% `badarg', …) и прочие теги пропускаем как есть — диагностика выживает.
+%% `{Class, Reason}'-пары (`error'/`exit'/`throw') разворачиваем рекурсивно:
+%% так чистится и проброшенный catch-контракт `normalize_oidcc/2'/`refresh_token/1',
+%% доехавший до вызывающего кода.
+-spec redact_reason(any()) -> any().
+redact_reason({'badmatch', Value}) ->
+    {'badmatch', redact_reason_value(Value)};
+redact_reason({'case_clause', Value}) ->
+    {'case_clause', redact_reason_value(Value)};
+redact_reason({'badmap', Value}) ->
+    {'badmap', redact_reason_value(Value)};
+redact_reason({'function_clause', Value}) ->
+    {'function_clause', redact_reason_value(Value)};
+redact_reason({Class, Reason}) when Class =:= 'error';
+                                    Class =:= 'exit';
+                                    Class =:= 'throw' ->
+    {Class, redact_reason(Reason)};
+redact_reason(Other) ->
+    Other.
+
+%% @doc Значение, встроенное в `Reason' краша: binary редактируем как секрет
+%% (в него могли попасть token/claim-байты), любую другую форму заменяем
+%% непрозрачным сентинелом — точной диагностики из значения не извлечь, а
+%% утечка недопустима.
+-spec redact_reason_value(any()) -> any().
+redact_reason_value(Value) when is_binary(Value) ->
+    redact(Value);
+redact_reason_value(_Value) ->
+    '$redacted'.
 
 %% @doc Присутствует ли поле — для presence-логов вместо значений-ПДн
 %% (`create_user/7', issue 15). `undefined'/пусто = отсутствует.
