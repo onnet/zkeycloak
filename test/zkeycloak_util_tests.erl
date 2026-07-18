@@ -442,20 +442,55 @@ redact_reason_masks_binary_in_badmatch_test() ->
     %% тег краша сохранён — сбой остаётся диагностируемым
     ?assertNotEqual('nomatch', binary:match(Fmt, <<"badmatch">>)).
 
-redact_reason_masks_case_clause_and_badmap_test() ->
-    %% case_clause / badmap — тот же класс: значение встроено прямо в Reason.
-    %% Не-binary форму (map claim'ов) заменяем непрозрачным сентинелом.
+redact_reason_masks_case_try_clause_and_badmap_test() ->
+    %% case_clause / try_clause / badmap — тот же класс: значение встроено
+    %% прямо в Reason (подтверждено в erl). Не-binary форму (map claim'ов)
+    %% заменяем непрозрачным сентинелом.
     Claims = #{<<"email">> => ?EMAIL, <<"sub">> => ?SUB},
     ?assertEqual({'case_clause', '$redacted'}
                 ,zkeycloak_util:redact_reason({'case_clause', Claims})),
+    ?assertEqual({'try_clause', '$redacted'}
+                ,zkeycloak_util:redact_reason({'try_clause', Claims})),
     ?assertEqual({'badmap', '$redacted'}
                 ,zkeycloak_util:redact_reason({'badmap', Claims})),
     ?assertEqual('nomatch'
                 ,binary:match(?FMT(zkeycloak_util:redact_reason({'case_clause', Claims}))
                              ,?EMAIL)).
 
+redact_reason_masks_oidcc_missing_claim_map_test() ->
+    %% P1 — ДОМИНИРУЮЩАЯ реальная утечка: oidcc в ШТАТНОМ error-протоколе
+    %% отдаёт `{error, {missing_claim, Claim, Claims}}' с ПОЛНОЙ декодированной
+    %% claims-map (рутинные nonce/aud/exp-провалы). 3-кортеж НЕ матчился 2-
+    %% кортежными клозами и проходил сырым и в normalize_oidcc-лог, и в
+    %% redact_reason-вызовы cb_zkeycloak_ext (:399 retrieve_userinfo).
+    ClaimsMap = maps:put(<<"nonce">>, <<"expected-nonce">>, userinfo()),
+    Err = {'error', {'missing_claim', <<"nonce">>, ClaimsMap}},
+    R = zkeycloak_util:redact_reason(Err),
+    Fmt = ?FMT(R),
+    %% ПДн из claims-map (email/ФИО) в лог-строку не попадают
+    ?assertEqual('nomatch', binary:match(Fmt, ?EMAIL)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"Иван"/utf8>>)),
+    %% имя клейма — публичная схема — остаётся диагностикой
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"nonce">>)),
+    ?assertMatch({'error', {'missing_claim', <<"nonce">>, '$redacted'}}, R).
+
+redact_reason_masks_oidcc_none_alg_used_test() ->
+    %% oidcc: токен подписан alg=none — reason несёт token-record / claims-map
+    %% (2-кортеж) либо сырой JWT + JWS (3-кортеж).
+    Claims = #{<<"email">> => ?EMAIL, <<"sub">> => ?SUB},
+    ?assertEqual({'none_alg_used', '$redacted'}
+                ,zkeycloak_util:redact_reason({'none_alg_used', Claims})),
+    ?assertEqual('nomatch'
+                ,binary:match(?FMT(zkeycloak_util:redact_reason({'none_alg_used', Claims}))
+                             ,?EMAIL)),
+    R3 = zkeycloak_util:redact_reason(
+           {'none_alg_used', <<"raw.jwt.LIVE-SECRET-payload">>, {'jose_jws', #{}}}),
+    ?assertEqual('nomatch', binary:match(?FMT(R3), <<"LIVE-SECRET">>)).
+
 redact_reason_passthrough_atoms_and_tags_test() ->
-    %% Диагностика без встроенного значения выживает как есть.
+    %% Диагностика без встроенного значения выживает как есть. `function_clause'
+    %% — голый атом (аргументы только в стеке, а он редактируется отдельно),
+    %% поэтому проходит без изменений (мёртвый `{function_clause,_}'-клоз убран).
     ?assertEqual('function_clause', zkeycloak_util:redact_reason('function_clause')),
     ?assertEqual('badarg', zkeycloak_util:redact_reason('badarg')),
     ?assertEqual({'missing_user_doc_on_refresh', {'error', 'not_found'}}

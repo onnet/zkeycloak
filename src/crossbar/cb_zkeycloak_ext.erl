@@ -396,7 +396,12 @@ authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mod
                     cb_context:add_system_error('insufficient_role', Context)
             end;
         {'error', Reason} ->
-            lager:info("authorize_and_issue[~p]  retrieve_userinfo failed ~p", [Mode, Reason]),
+            %% P1 (кросс-ревью 18.07): userinfo — основной носитель ПДн во всём
+            %% флоу, а `retrieve_userinfo/1' в штатном error-протоколе oidcc
+            %% отдаёт `{missing_claim, _, UserinfoClaims}' с ПОЛНОЙ claims-map.
+            %% Сырой `~p' лил её в лог — чистим через redact_reason/1.
+            lager:info("authorize_and_issue[~p]  retrieve_userinfo failed ~p"
+                      ,[Mode, zkeycloak_util:redact_reason(Reason)]),
             cb_context:add_system_error('invalid_credentials', Context)
     end.
 

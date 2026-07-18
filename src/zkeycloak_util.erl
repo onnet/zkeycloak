@@ -802,20 +802,30 @@ redact_stack_frame({M, F, Args, Loc}) when is_list(Args) ->
 redact_stack_frame(Frame) ->
     Frame.
 
-%% @doc Санитайзер `Reason' исключения перед тем, как он попадёт в лог-строку
-%% ИЛИ в проброшенный наверх `{Class, Reason}' (а оттуда — в лог
+%% @doc Санитайзер `Reason' ошибки/исключения перед тем, как он попадёт в
+%% лог-строку ИЛИ в проброшенный наверх `{Class, Reason}' (а оттуда — в лог
 %% `cb_zkeycloak_ext'). `redact_stack/1' уже чистит АРГУМЕНТЫ фреймов, но сам
-%% `Reason' печатался сырым — асимметрия защиты (P3-находка кросс-ревью 18.07):
-%% `error:{badmatch,V}'/`{case_clause,V}'/`{badmap,M}' ВСТРАИВАЮТ несовпавшее
-%% значение прямо в `Reason'. В этом модуле таким значением бывают
-%% декодированные байты claim'ов (`jwt_sub_unverified/1': `base64:decode' →
-%% `kz_json:decode' payload'а JWT) или token-материал.
+%% `Reason' печатался сырым — асимметрия защиты (P1/P3-находки кросс-ревью 18.07).
+%% Два класса встраивания значения в `Reason':
 %%
-%% Сохраняем ТЕГ краша (диагностика — какого класса сбой), но вычищаем
-%% значение: binary → `redact/1' (префикс+длина, тот же класс секрета, что
-%% токены), любую другую форму (map claim'ов, JSON-объект, список) → непрозрачный
-%% сентинел `'$redacted''. Атомы без встроенного значения (`function_clause',
-%% `badarg', …) и прочие теги пропускаем как есть — диагностика выживает.
+%%   1) BEAM-краши: `error:{badmatch,V}'/`{case_clause,V}'/`{try_clause,V}'/
+%%      `{badmap,M}' ВСТРАИВАЮТ несовпавшее значение прямо в `Reason'. В этом
+%%      модуле таким значением бывают декодированные байты claim'ов
+%%      (`jwt_sub_unverified/1': `base64:decode' → `kz_json:decode' payload'а
+%%      JWT) или token-материал.
+%%   2) ШТАТНЫЙ error-протокол oidcc (ДОМИНИРУЮЩАЯ реальная форма, P1):
+%%      `{missing_claim, Claim, Claims}' — 3-й элемент это ПОЛНАЯ декодированная
+%%      claims-map (рутинные nonce/aud/exp-провалы; `oidcc_token'/`oidcc_jwt_util'/
+%%      `oidcc_userinfo'); `{none_alg_used, TokenRecord|Claims}' и
+%%      `{none_alg_used, Jwt, Jws}' — token-record / claims / сырой JWT.
+%%
+%% Сохраняем ТЕГ краша и полезную диагностику (имя клейма `Claim' — публичная
+%% схема, не ПДн), но вычищаем встроенное значение: binary → `redact/1'
+%% (префикс+длина, тот же класс секрета, что токены), любую другую форму
+%% (claims-map, token-record, JSON-объект, список) → непрозрачный сентинел
+%% `'$redacted''. Атомы без встроенного значения (`function_clause' — его
+%% аргументы живут ТОЛЬКО в стеке, а он редактируется отдельно; `badarg',
+%% `token_expired', …) и прочие теги пропускаем как есть — диагностика выживает.
 %% `{Class, Reason}'-пары (`error'/`exit'/`throw') разворачиваем рекурсивно:
 %% так чистится и проброшенный catch-контракт `normalize_oidcc/2'/`refresh_token/1',
 %% доехавший до вызывающего кода.
@@ -824,10 +834,19 @@ redact_reason({'badmatch', Value}) ->
     {'badmatch', redact_reason_value(Value)};
 redact_reason({'case_clause', Value}) ->
     {'case_clause', redact_reason_value(Value)};
+redact_reason({'try_clause', Value}) ->
+    {'try_clause', redact_reason_value(Value)};
 redact_reason({'badmap', Value}) ->
     {'badmap', redact_reason_value(Value)};
-redact_reason({'function_clause', Value}) ->
-    {'function_clause', redact_reason_value(Value)};
+redact_reason({'missing_claim', Claim, _Claims}) ->
+    %% P1: 3-й элемент — полная claims-map (ПДн); имя клейма оставляем.
+    {'missing_claim', Claim, '$redacted'};
+redact_reason({'none_alg_used', Value}) ->
+    %% token-record либо claims-map — обе не-binary, но зовём общий редактор.
+    {'none_alg_used', redact_reason_value(Value)};
+redact_reason({'none_alg_used', Jwt, Jws}) ->
+    %% сырой JWT + JWS во фрейме валидации alg=none.
+    {'none_alg_used', redact_reason_value(Jwt), redact_reason_value(Jws)};
 redact_reason({Class, Reason}) when Class =:= 'error';
                                     Class =:= 'exit';
                                     Class =:= 'throw' ->
