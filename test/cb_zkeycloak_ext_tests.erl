@@ -123,6 +123,48 @@ cleanup_boundaries(_) ->
     'ok'.
 
 %%%=============================================================================
+%%% logout `id_token_hint' — транспорт POST-тело vs GET-query (issue 02 волна 2)
+%%%
+%%% GET клал сырой id_token (ПДн) в query-string → он оседал в access-логах
+%%% nginx/бэкенда. POST переносит hint в JSON-тело. GET сохранён на переходный
+%%% период. `logout_id_token_hint/1' — точка выбора источника (открыта для
+%%% теста через `-ifdef(TEST). -export'); downstream (`logout_url/1' → KC
+%%% end_session) для обеих веток идентичен и здесь не дублируется.
+%%%=============================================================================
+
+%% Зеркалят `kazoo_web.hrl' — чтобы не тащить include-цепочку crossbar в тест.
+-define(HTTP_GET, <<"GET">>).
+-define(HTTP_POST, <<"POST">>).
+-define(HINT, <<"eyJhbGciOiJSUzI1NiJ9.dummy-id-token-hint.sig">>).
+
+logout_hint_from_post_body_test() ->
+    %% POST — целевой транспорт: hint из тела (`req_data', inner data-конверт).
+    Ctx0 = cb_context:set_req_verb(cb_context:new(), ?HTTP_POST),
+    Ctx = cb_context:set_req_data(Ctx0, kz_json:from_list([{<<"id_token_hint">>, ?HINT}])),
+    ?assertEqual(?HINT, cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
+
+logout_hint_from_get_query_test() ->
+    %% GET (legacy) — hint из query-string; поведение сохранено дословно.
+    Ctx0 = cb_context:set_req_verb(cb_context:new(), ?HTTP_GET),
+    Ctx = cb_context:set_query_string(Ctx0, kz_json:from_list([{<<"id_token_hint">>, ?HINT}])),
+    ?assertEqual(?HINT, cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
+
+logout_post_ignores_query_hint_test() ->
+    %% Подтверждение смены транспорта: POST-ветка НЕ читает QS, поэтому hint,
+    %% просочившийся в query при POST, ею не подхватывается (тело пустое → undefined).
+    Ctx0 = cb_context:set_req_verb(cb_context:new(), ?HTTP_POST),
+    Ctx = cb_context:set_query_string(Ctx0, kz_json:from_list([{<<"id_token_hint">>, ?HINT}])),
+    ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
+
+logout_missing_hint_undefined_test() ->
+    %% Hint'а нет — обе ветки дают `undefined' (KC confirmation-page путь;
+    %% канон Option A: end_session всё равно уходит, но без silent-logout).
+    CtxPost = cb_context:set_req_verb(cb_context:new(), ?HTTP_POST),
+    ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(CtxPost)),
+    CtxGet = cb_context:set_req_verb(cb_context:new(), ?HTTP_GET),
+    ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(CtxGet)).
+
+%%%=============================================================================
 %%% helpers
 %%%=============================================================================
 

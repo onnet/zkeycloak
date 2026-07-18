@@ -17,6 +17,7 @@
 %% Внутренние auth-гейты, открытые для EUnit (`cb_zkeycloak_ext_tests').
 -export([provide_keycloak_token/6
         ,provide_keycloak_token/7
+        ,logout_id_token_hint/1
         ]).
 -endif.
 
@@ -47,7 +48,11 @@ allowed_methods() -> [?HTTP_POST, ?HTTP_GET].
 allowed_methods(?AUTH_LINK) -> [?HTTP_GET];
 allowed_methods(?AUTH_CALLBACK) -> [?HTTP_GET];
 allowed_methods(?KERBEROS_LOGIN) -> [?HTTP_GET];
-allowed_methods(?LOGOUT) -> [?HTTP_GET];
+%% logout: POST — целевой транспорт `id_token_hint' (в JSON-теле, не в
+%% query-string → не оседает в access-логах). GET оставлен на переходный
+%% период (старые бандлы/вкладки с закэшированным фронтом); его снятие —
+%% отдельный follow-up после раскатки фронта.
+allowed_methods(?LOGOUT) -> [?HTTP_GET, ?HTTP_POST];
 allowed_methods(?REFRESH) -> [?HTTP_POST];
 allowed_methods(?ZKEYCLOAK) -> [?HTTP_POST, ?HTTP_GET].
 
@@ -99,7 +104,10 @@ authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"auth_callback">>]}], Method
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}], Method) when Method =:= ?HTTP_GET ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing kerberos_login"),
     'true';
-authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}], Method) when Method =:= ?HTTP_GET ->
+authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}], Method)
+  when Method =:= ?HTTP_GET;
+       Method =:= ?HTTP_POST ->
+    %% POST — новый транспорт `id_token_hint' (тело), GET — legacy-совместимость.
     lager:info("authorize_nouns_zkeycloak_ext authorizing logout"),
     'true';
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"refresh">>]}], Method) when Method =:= ?HTTP_POST ->
@@ -254,18 +262,28 @@ validate(Context, ?KERBEROS_LOGIN) ->
             cb_context:add_system_error('forbidden', Context)
     end;
 validate(Context, ?LOGOUT) ->
-    %% `id_token_hint' приходит из QS — фронт берёт его из своего state
-    %% (`kc_id_token', enrich_resp_with_kc_tokens/3 положил его в auth-response).
-    %% Без hint'а KC показывает confirmation page по OIDC-спеке.
-    QS = cb_context:query_string(Context),
-    IdTokenHint = kz_json:get_ne_binary_value(<<"id_token_hint">>, QS),
+    %% `id_token_hint' — сырой id_token (ПДн: `sub'/`email'/`name'). Фронт берёт
+    %% его из своего state (`kc_id_token', enrich_resp_with_kc_tokens/3 положил
+    %% его в auth-response). Без hint'а KC показывает confirmation page по
+    %% OIDC-спеке (канон Option A — logout всегда с hint'ом — не меняется).
+    %%
+    %% Транспорт hint'а до бэкенда:
+    %%   POST — целевой: hint в JSON-теле (`{"data":{"id_token_hint":…}}'),
+    %%          в access-логи nginx/бэкенда НЕ попадает;
+    %%   GET  — legacy: hint в query-string оседал в access-логах (та же
+    %%          утечка, что закрыл issue 01 для сырого URL в lager) — ветка
+    %%          сохранена на переходный период, снятие отдельным follow-up.
+    %% Downstream (KC end_session с hint) для обеих веток ИДЕНТИЧЕН.
+    IdTokenHint = logout_id_token_hint(Context),
     LogoutUrl = zkeycloak_util:logout_url(IdTokenHint),
     %% issue 01: LogoutUrl несёт `id_token_hint=<сырой id_token>' в query —
     %% полный URL в лог писать нельзя. Логируем redacted-hint (он же сигналит
     %% наличие/отсутствие hint'а: `undefined' = no); endpoint восстановим из
-    %% конфига. Сам lager:info сохранён.
-    lager:info("zkeycloak logout_url: id_token_hint=~s"
-              ,[zkeycloak_util:redact(IdTokenHint)]),
+    %% конфига. Тело POST здесь НЕ логируем сырым (в `authorize/2' оно уже
+    %% идёт через `redact_req_data/1' — `id_token_hint' в ?SENSITIVE_BODY_KEYS).
+    %% Сам lager:info сохранён.
+    lager:info("zkeycloak logout_url: verb=~s id_token_hint=~s"
+              ,[cb_context:req_verb(Context), zkeycloak_util:redact(IdTokenHint)]),
     JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
 %% @doc Обмен refresh_token → новый Kazoo auth_token + новый KC refresh/id.
@@ -312,6 +330,20 @@ zkeycloak_ext_post(Context) ->
     lager:info("zkeycloak_ext_post/1 req_data: ~p",[zkeycloak_util:redact_req_data(cb_context:req_data(Context))]),
     lager:info("zkeycloak_ext_post/1 req_json: ~p",[zkeycloak_util:redact_req_data(ReqJSON)]),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, kz_json:new()), 'success').
+
+%% @doc Достать `id_token_hint' для logout из тела (POST) или query-string (GET).
+%% POST — целевой транспорт: hint (сырой id_token c ПДн) в JSON-теле НЕ
+%% попадает в access-логи, в отличие от GET-query. `req_data/1' читает
+%% inner-объект `data'-конверта тела (crossbar-конвенция `{"data":{…}}',
+%% симметрично `validate(?REFRESH)'); `query_string/1' — GET-параметры.
+%% GET-ветка — legacy на переходный период (старые бандлы).
+-spec logout_id_token_hint(cb_context:context()) -> kz_term:api_ne_binary().
+logout_id_token_hint(Context) ->
+    Source = case cb_context:req_verb(Context) of
+                 ?HTTP_POST -> cb_context:req_data(Context);
+                 _ -> cb_context:query_string(Context)
+             end,
+    kz_json:get_ne_binary_value(<<"id_token_hint">>, Source).
 
 %% @doc Обмен refresh_token на KC и формирование Kazoo-сессии.
 %% Структура oidcc-tuple строится в zkeycloak_util:retrieve_token; здесь
