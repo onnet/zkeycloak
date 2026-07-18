@@ -850,6 +850,12 @@ redact_reason({'try_clause', Value}) ->
     {'try_clause', redact_reason_value(Value)};
 redact_reason({'badmap', Value}) ->
     {'badmap', redact_reason_value(Value)};
+redact_reason({'badrecord', Value}) ->
+    %% P3 (кросс-ревью 18.07 волна 2): OTP встраивает несовпавшее значение в
+    %% `Reason' так же, как в `{badmatch,V}' (подтверждено в erl:
+    %% `error:{badrecord, <value>}'). В этом модуле таким значением бывают
+    %% декодированные claim-байты / token-материал — режем как badmatch.
+    {'badrecord', redact_reason_value(Value)};
 redact_reason({'missing_claim', Claim, _Claims}) ->
     %% P1: 3-й элемент — полная claims-map (ПДн); имя клейма оставляем.
     {'missing_claim', Claim, '$redacted'};
@@ -867,6 +873,15 @@ redact_reason({'http_error', Code, _ErrBody}) ->
     %% стороны. Редакт по форме, не по доказанному содержимому; `Code' —
     %% диагностика, оставляем.
     {'http_error', Code, '$redacted'};
+redact_reason({'use_dpop_nonce', Nonce, _HttpBodyResult}) ->
+    %% P3 (кросс-ревью 18.07 волна 2): `oidcc_http_util' отдаёт
+    %% `{use_dpop_nonce, Nonce, HttpBodyResult}' (`oidcc_http_util.erl:28/165'),
+    %% где 3-й элемент — ТО ЖЕ тело HTTP-ответа KC, что и в `{http_error,_,_}'
+    %% (`binary()|map()', server-controlled, без схемы). Сегодня недостижимо без
+    %% DPoP (гарды `DpopOpts=:=#{}' в oidcc), но по shape-доктрине дыра: режем
+    %% тело в `'$redacted'', `Nonce' (anti-replay-значение) оставляем как
+    %% диагностику — зеркально `{http_error, Code, _}'.
+    {'use_dpop_nonce', Nonce, '$redacted'};
 redact_reason({'invalid_property', {Field, GivenValue}}) ->
     %% P2 (кросс-ревью 18.07 волна 2): штатный `error()'-протокол oidcc —
     %% `oidcc_token' отдаёт `{invalid_property, {Field, GivenValue}}'

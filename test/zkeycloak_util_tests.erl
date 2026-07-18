@@ -520,6 +520,30 @@ redact_reason_masks_oidcc_http_error_body_test() ->
     ?assertNotEqual('nomatch', binary:match(Fmt, <<"401">>)),
     ?assertMatch({'error', {'http_error', 401, '$redacted'}}, R).
 
+redact_reason_masks_badrecord_value_test() ->
+    %% P3 (волна 2): `error:{badrecord, V}' встраивает значение как badmatch
+    %% (подтверждено в erl). В этом модуле V — декодированные claim-байты /
+    %% token-материал.
+    Reason = {'badrecord', <<"decoded-claim-bytes-LIVE-SECRET">>},
+    Fmt = ?FMT(zkeycloak_util:redact_reason(Reason)),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"LIVE-SECRET">>)),
+    %% тег краша сохранён — сбой диагностируется
+    ?assertNotEqual('nomatch', binary:match(Fmt, <<"badrecord">>)),
+    %% не-binary значение (map claim'ов) → непрозрачный сентинел
+    ?assertEqual({'badrecord', '$redacted'}
+                ,zkeycloak_util:redact_reason({'badrecord', #{<<"email">> => ?EMAIL}})).
+
+redact_reason_masks_use_dpop_nonce_body_test() ->
+    %% P3 (волна 2): 3-й элемент `{use_dpop_nonce, Nonce, HttpBodyResult}' —
+    %% то же тело HTTP-ответа KC, что в http_error (oidcc_http_util.erl:28/165).
+    Err = {'error', {'use_dpop_nonce', <<"srv-nonce">>
+                    ,#{<<"error_description">> => <<"body LIVE-SECRET">>}}},
+    R = zkeycloak_util:redact_reason(Err),
+    Fmt = ?FMT(R),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"LIVE-SECRET">>)),
+    %% Nonce (anti-replay) остаётся диагностикой, тело — сентинел
+    ?assertMatch({'error', {'use_dpop_nonce', <<"srv-nonce">>, '$redacted'}}, R).
+
 redact_reason_masks_oidcc_invalid_property_token_test() ->
     %% P2 (волна 2): oidcc `{invalid_property, {Field, GivenValue}}' — для
     %% access_token/refresh_token/id_token `GivenValue' = сырой токен-материал
