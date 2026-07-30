@@ -18,6 +18,7 @@
 -export([provide_keycloak_token/6
         ,provide_keycloak_token/7
         ,logout_id_token_hint/1
+        ,check_user_doc/5
         ]).
 -endif.
 
@@ -687,6 +688,14 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
 %% miss возвращаем тегированную ошибку, чтобы вызывающий смапил её в
 %% `invalid_credentials' и mobile (zfield) пошёл в полный AppAuth-flow
 %% (см. контракт в комментариях handle_refresh выше).
+%%
+%% G-1 (gap-анализ «центр периметра», решение Р1): обе ветки гейтят по
+%% `enabled' user-doc'а — деактивированный через MDM/cb_users пользователь
+%% (`enabled=false') не получает Kazoo-токен, пока жива его учётка в
+%% KC/LDAP. Классический путь (`cb_user_auth') блокирует так же. Без
+%% whitelist: сервисные учётки локальные, через Keycloak не ходят.
+%% На login-ветке гейт ПОСЛЕ `ensure_user_doc' — JIT-созданный док
+%% enabled по умолчанию, поведение первого входа не меняется.
 -spec check_user_doc('login' | 'refresh'
                     ,kz_term:ne_binary()
                     ,kz_term:ne_binary()
@@ -694,11 +703,39 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                     ,map()
                     ) -> 'ok' | {'error', term()}.
 check_user_doc('login', DbName, AccountId, OwnerId, UserInfoMap) ->
-    ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap);
+    case ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) of
+        'ok' -> check_user_enabled(DbName, OwnerId);
+        {'error', _} = Err -> Err
+    end;
 check_user_doc('refresh', DbName, _AccountId, OwnerId, _UserInfoMap) ->
     case kz_datamgr:open_doc(DbName, OwnerId) of
-        {'ok', _} -> 'ok';
+        {'ok', UserDoc} -> user_enabled_gate(UserDoc);
         Err -> {'error', {'missing_user_doc_on_refresh', Err}}
+    end.
+
+%% @doc Перечитать user-doc после `ensure_user_doc' и прогнать enabled-гейт.
+%% Сбой чтения здесь — только что открытый/созданный док не читается —
+%% это datastore-проблема, а не «юзера нет»: отвечаем 503, не 401.
+-spec check_user_enabled(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          'ok' | {'error', term()}.
+check_user_enabled(DbName, OwnerId) ->
+    case kz_datamgr:open_doc(DbName, OwnerId) of
+        {'ok', UserDoc} -> user_enabled_gate(UserDoc);
+        {'error', _} = Err ->
+            lager:warning("check_user_enabled: re-open failed owner_id=~p err=~p",
+                          [OwnerId, Err]),
+            {'error', 'datastore_unreachable'}
+    end.
+
+%% @doc Гейт по полю `enabled' user-doc'а. Аксессор — `kzd_users:enabled/1'
+%% (дефолт `true': док без поля = активный, каноническая семантика Kazoo,
+%% та же, что в `cb_user_auth'). NB: `kzd_users:is_enabled/1' в кодбейзе
+%% не существует — issue-01 ссылался на него по памяти.
+-spec user_enabled_gate(kz_json:object()) -> 'ok' | {'error', 'user_disabled'}.
+user_enabled_gate(UserDoc) ->
+    case kzd_users:enabled(UserDoc) of
+        'true' -> 'ok';
+        'false' -> {'error', 'user_disabled'}
     end.
 
 %% @doc Гарантировать, что у `OwnerId' есть user-doc в account-db. Если
@@ -743,6 +780,11 @@ ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) ->
 %%                              отсутствует — обычно `last_name' у юзера с
 %%                              пустым `sn' в AD).
 %%   `{system_error,Error}'   — `add_system_error(Error,_)' (как в cb_users).
+%%   `'user_disabled''         — 401 `invalid_credentials' (G-1): наружу НЕ
+%%                              отличаем «деактивирован» от «кредов нет» —
+%%                              не подсказываем перебором, что учётка
+%%                              существует; причина видна оператору в
+%%                              warning-логе `provide_keycloak_token'.
 %%   `'datastore_unreachable'' — 503, чтобы клиент ретраил.
 %%   Иное (catch-all, `EXIT')  — `unspecified_fault' (500), чтобы оператор не
 %%                              путал инфра-проблему с проблемой AD-профиля.
@@ -751,6 +793,8 @@ ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) ->
                               ,term()
                               ) -> cb_context:context().
 reject_user_provisioning(Context, 'refresh', _Reason) ->
+    cb_context:add_system_error('invalid_credentials', Context);
+reject_user_provisioning(Context, 'login', 'user_disabled') ->
     cb_context:add_system_error('invalid_credentials', Context);
 reject_user_provisioning(Context, 'login', {'validation_errors', Errors}) ->
     cb_context:add_doc_validation_errors(Context, Errors);

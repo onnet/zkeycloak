@@ -197,6 +197,78 @@ cleanup_boundaries(_) ->
     'ok'.
 
 %%%=============================================================================
+%%% enabled-гейт user-doc'а (G-1, решение Р1 гриллинга 30.07)
+%%%
+%%% Деактивированный пользователь (`enabled=false' — MDM-шов либо cb_users)
+%%% не должен получать Kazoo-токен ни на login-, ни на refresh-ветке, пока
+%%% его учётка жива в KC/LDAP. Док без поля `enabled' = активный (дефолт
+%%% `kzd_users:enabled/1' — та же семантика, что у `cb_user_auth').
+%%%=============================================================================
+
+-define(DISABLED_DOC, kz_json:from_list([{<<"enabled">>, 'false'}])).
+-define(ENABLED_DOC, kz_json:from_list([{<<"enabled">>, 'true'}])).
+
+enabled_gate_test_() ->
+    {'setup', fun setup_boundaries/0, fun cleanup_boundaries/1,
+     fun(_) ->
+             [{"login: enabled=false → 401 через полный гейт-хвост",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', ?DISABLED_DOC} end),
+                       UserInfo = #{<<"sub">> => ?SUB_UUID
+                                   ,<<"account_id">> => ?ACCOUNT_ID
+                                   },
+                       Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+                               cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login'),
+                       assert_401(Ctx)
+               end}
+             ,{"refresh: enabled=false → 401 через полный гейт-хвост",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', ?DISABLED_DOC} end),
+                       UserInfo = #{<<"sub">> => ?SUB_UUID
+                                   ,<<"account_id">> => ?ACCOUNT_ID
+                                   },
+                       Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+                               cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'refresh'),
+                       assert_401(Ctx)
+               end}
+             ,{"check_user_doc: enabled=true → ok (обе ветки)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', ?ENABLED_DOC} end),
+                       ?assertEqual('ok', check_user_doc('login')),
+                       ?assertEqual('ok', check_user_doc('refresh'))
+               end}
+             ,{"check_user_doc: поля enabled нет → ok (дефолт активный)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+                       ?assertEqual('ok', check_user_doc('login')),
+                       ?assertEqual('ok', check_user_doc('refresh'))
+               end}
+             ,{"check_user_doc: enabled=false → тегированный user_disabled",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', ?DISABLED_DOC} end),
+                       ?assertEqual({'error', 'user_disabled'}, check_user_doc('login')),
+                       ?assertEqual({'error', 'user_disabled'}, check_user_doc('refresh'))
+               end}
+             ,{"refresh: дока нет → missing_user_doc_on_refresh (контракт сохранён)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'error', 'not_found'} end),
+                       ?assertMatch({'error', {'missing_user_doc_on_refresh', _}},
+                                    check_user_doc('refresh'))
+               end}
+             ]
+     end}.
+
+check_user_doc(Mode) ->
+    cb_zkeycloak_ext:check_user_doc(Mode, <<"account%2Ffe%2Fdc%2Fba">>,
+                                    ?ACCOUNT_ID, ?OWNER_ID, #{}).
+
+%%%=============================================================================
 %%% logout `id_token_hint' — транспорт POST-тело vs GET-query (issue 02 волна 2)
 %%%
 %%% GET клал сырой id_token (ПДн) в query-string → он оседал в access-логах
