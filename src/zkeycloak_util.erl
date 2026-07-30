@@ -8,6 +8,8 @@
         ,client_secret/0
         ,redirect_uri/0
         ,is_configured/0
+        ,discovery_worker_opts/0
+        ,is_provider_unavailable/1
         ,preferred_auth_methods/0
         ,retrieve_token/1
         ,retrieve_token/2
@@ -47,6 +49,11 @@
         ,redact_stack/1
         ,jwt_sub_unverified/1
         ]).
+%% Чистое ядро валидации backoff-настроек дискавери, открытое для EUnit.
+%% Наружу идёт только `discovery_worker_opts/0' (он читает `kapps_config');
+%% валидация вынесена отдельной чистой функцией именно чтобы её можно было
+%% покрыть тестами без мока конфига.
+-export([backoff_opts/4]).
 -endif.
 
 %% @doc HTTP-заголовки, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми: несут
@@ -171,6 +178,44 @@
 
 -define(ISSUER_UNSET, <<"issuer">>).
 
+%% @doc Дефолты самовосстановления oidcc discovery-воркера — см.
+%% `discovery_worker_opts/0'. `random_exponential' (а не `exponential') —
+%% чтобы четыре ноды, потерявшие KC одновременно, не долбились в него в такт
+%% после его возврата. Потолок 30 s = максимальная задержка восстановления
+%% после того, как KC поднялся; минимум 1 s — чтобы мгновенный `econnrefused'
+%% не превращался в busy-loop.
+-define(DEFAULT_BACKOFF_TYPE, 'random_exponential').
+-define(DEFAULT_BACKOFF_MIN_MS, 1000).
+-define(DEFAULT_BACKOFF_MAX_MS, 30000).
+
+%% @doc Таймаут HTTP-запроса дискавери (`.well-known' + JWKS). Дефолт самого
+%% oidcc — `timer:minutes(1)' (`oidcc_http_util:request/4'), и это ЗАМЕТНАЯ
+%% величина: воркер — обычный `gen_server', HTTP он делает внутри
+%% `handle_continue', т.е. на всё это время перестаёт отвечать на
+%% `gen_server:call'. А `oidcc_client_context:from_configuration_worker' зовёт
+%% его с дефолтными 5 s ⇒ каждый логин в это окно получал бы `exit:{timeout,_}'.
+%% До этого плана окно было неважно (воркер просто умирал), с backoff'ом —
+%% важно: воркер живёт и ретраит. 10 s достаточно с запасом для `.well-known'
+%% в локальной сети и на порядок короче минуты.
+-define(DEFAULT_DISCOVERY_TIMEOUT_MS, 10000).
+
+%% @doc Потолок HTTP-запроса на ПРЯМЫХ вызовах KC (`/token', `/userinfo').
+%% Отдельный ключ от discovery намеренно: там небольшой статический
+%% `.well-known'/JWKS, здесь — обмен, который на стороне KC тянет LDAP-федерацию
+%% и БД, т.е. законно медленнее. Это ПОТОЛОК ресурса, а не цель тюнинга:
+%% интерактивный вход, идущий 30 s, для пользователя уже сломан (браузер и
+%% человек сдались раньше), а вот crossbar-воркер по дефолту oidcc держался бы
+%% занятым МИНУТУ на каждую попытку входа при лежащем KC. Уменьшать этот
+%% дефолт без замера реальной латентности логина не следует.
+-define(DEFAULT_KC_REQUEST_TIMEOUT_MS, 30000).
+
+%% @doc Типы backoff'а `oidcc_backoff:type()', которые нам ГОДЯТСЯ. Четвёртый
+%% тип библиотеки — `stop' (её дефолт) — здесь намеренно отсутствует: это ровно
+%% то значение, при котором воркер умирает на первой же ошибке дискавери, т.е.
+%% инцидент 29.07 в чистом виде. Эксплуатационной нужды в нём нет, а как ручка
+%% конфига он был бы взведённым ружьём.
+-define(ALLOWED_BACKOFF_TYPES, ['exponential', 'random', 'random_exponential']).
+
 -spec issuer() -> kz_term:ne_binary().
 issuer() ->
     kapps_config:get_ne_binary(<<"zkeycloak">>, <<"issuer">>, ?ISSUER_UNSET).
@@ -206,6 +251,169 @@ is_http_url(<<"http://", _/binary>>) -> 'true';
 is_http_url(<<"https://", _/binary>>) -> 'true';
 is_http_url(_) -> 'false'.
 
+%%------------------------------------------------------------------------------
+%% @doc Опции `oidcc_provider_configuration_worker' в части САМОВОССТАНОВЛЕНИЯ
+%% (issuer/name добавляет `zkeycloak_oidcc_sup').
+%%
+%% Корень инцидента 29.07.2026: дефолт библиотеки — `backoff_type = stop', при
+%% котором первая же ошибка загрузки дискавери даёт
+%% `{stop,{configuration_load_failed,Reason},State}'. `econnrefused' приходит
+%% МГНОВЕННО, поэтому лимит рестартов супервизора (1000/3600 s) выгорает за доли
+%% секунды, дерево `zkeycloak' складывается и остаётся мёртвым до ручного
+%% `sup kapps_controller restart_app zkeycloak'. Симптом при этом обманчив:
+%% Keycloak пишет успешный `LOGIN', а портал — «invalid credentials», потому что
+%% обмен code→token падает уже у нас (`{error,provider_not_ready}').
+%%
+%% Лечение — не в настройке intensity супервизора (никакая её величина не спасает
+%% от мгновенного выгорания), а в том, что ребёнок НЕ ДОЛЖЕН падать на
+%% ожидаемо-транзиентном условии: `oidcc_provider_configuration_worker' умеет
+%% ретраить сам (`handle_backoff_retry/3' → `timer:send_after(Wait, backoff_retry)'),
+%% нужно лишь включить это опцией.
+-spec discovery_worker_opts() -> map().
+discovery_worker_opts() ->
+    backoff_opts(kapps_config:get_atom(<<"zkeycloak">>, <<"discovery_backoff_type">>
+                                      ,?DEFAULT_BACKOFF_TYPE)
+                ,kapps_config:get_integer(<<"zkeycloak">>, <<"discovery_backoff_min_ms">>
+                                         ,?DEFAULT_BACKOFF_MIN_MS)
+                ,kapps_config:get_integer(<<"zkeycloak">>, <<"discovery_backoff_max_ms">>
+                                         ,?DEFAULT_BACKOFF_MAX_MS)
+                ,kapps_config:get_integer(<<"zkeycloak">>, <<"discovery_request_timeout_ms">>
+                                         ,?DEFAULT_DISCOVERY_TIMEOUT_MS)
+                ).
+
+%% @doc Чистое ядро `discovery_worker_opts/0': валидация значений из конфига.
+%%
+%% Валидация здесь не «на всякий случай», а обязательна. `oidcc_backoff:handle_retry/4'
+%% защищён гардом `Min > 0, Max > 0, Max >= Min', а `priv_handle_retry/4' матчит
+%% закрытый набор типов — любое кривое значение из конфига даёт `function_clause'
+%% ВНУТРИ `handle_continue' воркера, т.е. ровно ту же смерть, которую этот код и
+%% чинит, только теперь ещё и без связи с доступностью KC. Кривое значение →
+%% warning + дефолт: интеграция важнее буквального исполнения опечатки.
+-spec backoff_opts(any(), any(), any(), any()) -> map().
+backoff_opts(Type, Min, Max, RequestTimeout) ->
+    {ValidMin, ValidMax} = backoff_bounds(Min, Max),
+    #{'backoff_type' => backoff_type(Type)
+     ,'backoff_min' => ValidMin
+     ,'backoff_max' => ValidMax
+     ,'provider_configuration_opts' =>
+          #{'request_opts' => #{'timeout' => discovery_timeout(RequestTimeout)}}
+     }.
+
+-spec backoff_type(any()) -> oidcc_backoff:type().
+backoff_type(Type) ->
+    case lists:member(Type, ?ALLOWED_BACKOFF_TYPES) of
+        'true' -> Type;
+        'false' ->
+            lager:warning("zkeycloak discovery_backoff_type ~p is not allowed"
+                          " (allowed: ~p; 'stop' is rejected on purpose —"
+                          " it reproduces the 29.07 outage), falling back to ~p"
+                         ,[Type, ?ALLOWED_BACKOFF_TYPES, ?DEFAULT_BACKOFF_TYPE]),
+            ?DEFAULT_BACKOFF_TYPE
+    end.
+
+%% @doc Границы backoff'а проверяются ПАРОЙ, а не по отдельности: гард
+%% `oidcc_backoff:handle_retry/4' требует `Max >= Min', и раздельная проверка
+%% («каждое положительное») пропустила бы валидную по отдельности, но
+%% перевёрнутую пару (min=30000, max=1000) прямиком в `function_clause'.
+-spec backoff_bounds(any(), any()) -> {pos_integer(), pos_integer()}.
+backoff_bounds(Min, Max) when is_integer(Min), is_integer(Max), Min > 0, Max >= Min ->
+    {Min, Max};
+backoff_bounds(Min, Max) ->
+    lager:warning("zkeycloak discovery backoff bounds ~p/~p are invalid"
+                  " (need integers, 0 < min =< max), falling back to ~p/~p"
+                 ,[Min, Max, ?DEFAULT_BACKOFF_MIN_MS, ?DEFAULT_BACKOFF_MAX_MS]),
+    {?DEFAULT_BACKOFF_MIN_MS, ?DEFAULT_BACKOFF_MAX_MS}.
+
+%% @doc Таймаут HTTP-запроса дискавери. `0' и отрицательные значения httpc
+%% трактует как «уже истёк», а `infinity' вернул бы ту самую блокировку
+%% `gen_server'а на неопределённый срок, от которой мы уходим — принимаем
+%% только положительное целое.
+-spec discovery_timeout(any()) -> pos_integer().
+discovery_timeout(Timeout) ->
+    positive_timeout(Timeout, ?DEFAULT_DISCOVERY_TIMEOUT_MS, <<"discovery_request_timeout_ms">>).
+
+%%------------------------------------------------------------------------------
+%% @doc `request_opts' для ПРЯМЫХ вызовов KC — `retrieve_token/3',
+%% `retrieve_userinfo/1', `introspect_token/1', `refresh_token/1'.
+%%
+%% Почему это отдельно от воркера. Обмен кода на токен идёт НЕ только через
+%% discovery-воркер: получив (возможно, закэшированную) конфигурацию,
+%% `oidcc_token'/`oidcc_userinfo' сами ходят в KC, и там действует ДЕФОЛТ
+%% библиотеки — `timer:minutes(1)' (`oidcc_http_util.erl:101'). Наш
+%% `discovery_request_timeout_ms' на эти вызовы не распространяется: он уезжает
+%% в `provider_configuration_opts' воркера. Итог без этой функции: при лежащем
+%% KC каждый вход занимал бы crossbar-воркер на минуту.
+%%
+%% NB про `retrieve_userinfo/1': тип `oidcc_userinfo:retrieve_opts()' ключ
+%% `request_opts' НЕ объявляет (в отличие от `oidcc_token' и
+%% `oidcc_token_introspection'), но реализация его читает и применяет ровно так
+%% же — `oidcc_userinfo.erl:168/352' — так что таймаут там честно работает. Это
+%% дыра в спеке вендорной библиотеки, а не наша ошибка; не «чините» её удалением.
+-spec kc_request_opts() -> map().
+kc_request_opts() ->
+    Timeout = positive_timeout(kapps_config:get_integer(<<"zkeycloak">>
+                                                       ,<<"kc_request_timeout_ms">>
+                                                       ,?DEFAULT_KC_REQUEST_TIMEOUT_MS)
+                              ,?DEFAULT_KC_REQUEST_TIMEOUT_MS
+                              ,<<"kc_request_timeout_ms">>
+                              ),
+    #{'timeout' => Timeout}.
+
+%% @doc Общий валидатор таймаутов из конфига (`Name' — только для лог-строки).
+-spec positive_timeout(any(), pos_integer(), kz_term:ne_binary()) -> pos_integer().
+positive_timeout(Timeout, _Default, _Name) when is_integer(Timeout), Timeout > 0 ->
+    Timeout;
+positive_timeout(Timeout, Default, Name) ->
+    lager:warning("zkeycloak ~s ~p is invalid (need a positive integer), falling back to ~p"
+                 ,[Name, Timeout, Default]),
+    Default.
+
+%%------------------------------------------------------------------------------
+%% @doc Отказ означает «провайдер (OIDC-дискавери) недоступен», а НЕ «клиент
+%% прислал плохие креды». Разница принципиальна для вызывающего: на «плохие
+%% креды» правильно начать авторизацию заново, на «провайдер недоступен» —
+%% подождать; перепутав их, портал бесконечно переиспользовал одноразовый `code'
+%% (в логах KC — `Code '<uuid>' already used', 14 повторов одного кода).
+%%
+%% ГРУППА 1 — не готов наш discovery-воркер (`oidcc_client_context:from_configuration_worker/4'):
+%%   `provider_not_ready' — воркер не зарегистрирован (мёртв) ЛИБО ещё не
+%%       загрузил конфигурацию;
+%%   `{exit,{timeout,_}}' — воркер ЖИВ, но занят HTTP-попыткой внутри
+%%       `handle_continue', а `oidcc' зовёт его `gen_server:call' с дефолтными 5 s.
+%%       Форма приезжает через catch-контракт `normalize_oidcc/2' (`{Class,Reason}');
+%%   `{exit,{noproc,_}}' — воркер умер между `whereis' и `gen_server:call'.
+%%
+%% ГРУППА 2 — недоступен САМ Keycloak на прямом вызове `/token'/`/userinfo'.
+%% Её легко упустить, и это была бы ровно та же ложь про креды, только на другом
+%% пути: обмен кода идёт НЕ только через воркер. Получив (возможно, закэшированную
+%% и ещё валидную) конфигурацию, `oidcc_token:retrieve/refresh' и
+%% `oidcc_userinfo:retrieve' сами ходят в KC через `oidcc_http_util:request/4', а
+%% та НИКОГДА не бросает исключение: и транспортный сбой, и не-2xx возвращаются
+%% обычным `{error, Reason}' (`oidcc_http_util.erl:128/167'). То есть эти формы
+%% приезжают в `normalize_oidcc/2' по НЕ-catch ветке, сырыми:
+%%   `timeout' / `{failed_connect,_}' / `socket_closed_remotely' — ошибки httpc
+%%       (ровно те, что видели в инциденте: `{configuration_load_failed,timeout}'
+%%       и `{...,{failed_connect,[...econnrefused]}}');
+%%   `{http_error, Code, _}' при `Code >= 500' — KC (или прокси перед ним) жив на
+%%       уровне TCP, но не обслуживает: 502/503/504 в окно рестарта KC.
+%%
+%% Порог ровно 500 — не косметика: `{http_error, 400, _}' это ШТАТНЫЙ
+%% `invalid_grant' (сгоревший/просроченный code, PKCE-mismatch), и утащить его в
+%% 503 значило бы замаскировать реальный отказ аутентификации под инфра-сбой —
+%% зеркальная ошибка той, которую чиним.
+%%
+%% Остальное (`invalid_grant', `missing_claim', `token_expired', …) — не про
+%% доступность провайдера, и трактуется как раньше.
+-spec is_provider_unavailable(any()) -> boolean().
+is_provider_unavailable('provider_not_ready') -> 'true';
+is_provider_unavailable({'exit', {'timeout', _}}) -> 'true';
+is_provider_unavailable({'exit', {'noproc', _}}) -> 'true';
+is_provider_unavailable('timeout') -> 'true';
+is_provider_unavailable('socket_closed_remotely') -> 'true';
+is_provider_unavailable({'failed_connect', _}) -> 'true';
+is_provider_unavailable({'http_error', Code, _}) when is_integer(Code), Code >= 500 -> 'true';
+is_provider_unavailable(_Reason) -> 'false'.
+
 -spec preferred_auth_methods() -> kz_term:ne_binary().
 preferred_auth_methods() ->
     case kapps_config:get(<<"zkeycloak">>, <<"preferred_auth_methods">>, [client_secret_basic, client_secret_post]) of
@@ -214,7 +422,7 @@ preferred_auth_methods() ->
         _ -> []
     end.
 
--spec auth_url() -> kz_term:ne_binary().
+-spec auth_url() -> {'ok', kz_term:ne_binary()} | {'error', any()}.
 auth_url() ->
     auth_url('undefined').
 
@@ -229,23 +437,47 @@ auth_url() ->
 %% url_extension — единственный корректный путь. Verifier участвует уже в
 %% /token обмене (`retrieve_token/3'), который PKCE-плумбинг уже умеет.
 %% `CodeChallenge='undefined'' → web-без-PKCE (обратная совместимость).
--spec auth_url(kz_term:api_ne_binary()) -> kz_term:ne_binary().
+%% Контракт `{ok,_} | {error,_}', а не голый URL (инцидент 29.07): жёсткий матч
+%% `{ok, RedirectUri} = Result' давал badmatch и грязный Crossbar-500 на самой
+%% ручке логина, стоило discovery-воркеру быть не готовым
+%% (`{error, provider_not_ready}'). Отказ обязан доезжать до клиента отказом,
+%% а не пятисоткой — тот же класс, что закрыл issue 05 для `retrieve_token/3'.
+-spec auth_url(kz_term:api_ne_binary()) -> {'ok', kz_term:ne_binary()} | {'error', any()}.
 auth_url(CodeChallenge) ->
     lager:info("zkeycloak auth_url: issuer=~s client_id=~s redirect_uri=~s pkce=~s",
                [issuer(), client_id(), redirect_uri(),
                 case CodeChallenge of 'undefined' -> <<"no">>; _ -> <<"yes">> end]),
+    redirect_url(<<"auth_url">>, auth_url_opts(CodeChallenge)).
+
+%% @doc Общий хвост `auth_url/1' и `kerberos_auth_url/1': построить /authorize-URL
+%% и свести результат к `{ok,_} | {error,_}'. Сборка URL (`kz_binary:join/2')
+%% живёт ВНУТРИ `normalize_oidcc/2' намеренно — дрейф формы `iodata()' от oidcc
+%% не должен становиться исключением на неаутентифицированном пути.
+-spec redirect_url(kz_term:ne_binary(), map()) ->
+          {'ok', kz_term:ne_binary()} | {'error', any()}.
+redirect_url(Tag, Opts) ->
     Result =
-        oidcc:create_redirect_url(
-          client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,auth_url_opts(CodeChallenge)
-         ),
-    lager:info("zkeycloak auth_url oidcc result: ~p", [Result]),
-    {ok, RedirectUri} = Result,
-    Url = kz_binary:join(RedirectUri, <<"">>),
-    lager:info("zkeycloak auth_url final: ~s", [Url]),
-    Url.
+        normalize_oidcc(Tag
+                       ,fun() ->
+                                case oidcc:create_redirect_url(client_id_atom()
+                                                              ,client_id()
+                                                              ,client_secret()
+                                                              ,Opts
+                                                              )
+                                of
+                                    {'ok', RedirectUri} ->
+                                        {'ok', kz_binary:join(RedirectUri, <<"">>)};
+                                    Other -> Other
+                                end
+                        end),
+    %% URL не секрет (client_id + публичный по дизайну PKCE `code_challenge'),
+    %% обе исторические лог-строки сохраняем как были.
+    lager:info("zkeycloak ~s oidcc result: ~p", [Tag, Result]),
+    _ = case Result of
+            {'ok', Url} -> lager:info("zkeycloak ~s final: ~s", [Tag, Url]);
+            {'error', _} -> 'ok'
+        end,
+    Result.
 
 %% @doc Opts для `oidcc:create_redirect_url' — с PKCE-challenge (S256) или без.
 -spec auth_url_opts(kz_term:api_ne_binary()) -> map().
@@ -269,11 +501,13 @@ kerberos_enabled() ->
 kerberos_idp_hint() ->
     kapps_config:get_ne_binary(<<"zkeycloak">>, <<"kerberos_idp_hint">>, <<"kerberos">>).
 
--spec kerberos_auth_url() -> kz_term:ne_binary().
+-spec kerberos_auth_url() -> {'ok', kz_term:ne_binary()} | {'error', any()}.
 kerberos_auth_url() ->
     kerberos_auth_url(#{}).
 
--spec kerberos_auth_url(map()) -> kz_term:ne_binary().
+%% Контракт `{ok,_} | {error,_}' — по той же причине, что у `auth_url/1'
+%% (badmatch-500 на не готовом discovery-воркере, инцидент 29.07).
+-spec kerberos_auth_url(map()) -> {'ok', kz_term:ne_binary()} | {'error', any()}.
 kerberos_auth_url(ExtraOpts) ->
     BaseExtension = [{<<"kc_idp_hint">>, kerberos_idp_hint()}],
     PromptExtension = case maps:get('prompt', ExtraOpts, 'undefined') of
@@ -294,21 +528,12 @@ kerberos_auth_url(ExtraOpts) ->
     lager:info("zkeycloak kerberos_auth_url: issuer=~s client_id=~s redirect_uri=~s pkce=~s",
                [issuer(), client_id(), redirect_uri(),
                 case PkceExtension of [] -> <<"no">>; _ -> <<"yes">> end]),
-    Result =
-        oidcc:create_redirect_url(
-          client_id_atom()
-         ,client_id()
-         ,client_secret()
-         ,#{'redirect_uri' => redirect_uri()
-           ,'preferred_auth_methods' => preferred_auth_methods()
-           ,'url_extension' => BaseExtension ++ PromptExtension ++ PkceExtension
-           }
-         ),
-    lager:info("zkeycloak kerberos_auth_url oidcc result: ~p", [Result]),
-    {ok, RedirectUri} = Result,
-    Url = kz_binary:join(RedirectUri, <<"">>),
-    lager:info("zkeycloak kerberos_auth_url final: ~s", [Url]),
-    Url.
+    redirect_url(<<"kerberos_auth_url">>
+                ,#{'redirect_uri' => redirect_uri()
+                  ,'preferred_auth_methods' => preferred_auth_methods()
+                  ,'url_extension' => BaseExtension ++ PromptExtension ++ PkceExtension
+                  }
+                ).
 
 -spec retrieve_token(kz_term:ne_binary()) ->
           {'ok', tuple()} | {'error', any()}.
@@ -340,6 +565,9 @@ retrieve_token(AuthCode, RedirectUri, PkceVerifier) ->
                [RedirectUri, case PkceVerifier of 'undefined' -> <<"no">>; _ -> <<"yes">> end]),
     BaseOpts = #{'redirect_uri' => RedirectUri
                 ,'preferred_auth_methods' => preferred_auth_methods()
+                 %% Потолок ожидания KC — иначе дефолт oidcc держит воркер минуту
+                 %% на попытку входа при лежащем KC (см. `kc_request_opts/0').
+                ,'request_opts' => kc_request_opts()
                 },
     Opts = case PkceVerifier of
                'undefined' -> BaseOpts;
@@ -378,7 +606,7 @@ retrieve_userinfo(Token) ->
                              ,client_id_atom()
                              ,client_id()
                              ,client_secret()
-                             ,#{}
+                             ,#{'request_opts' => kc_request_opts()}
                              )
                     end).
 
@@ -394,7 +622,7 @@ introspect_token(Token) ->
                              ,client_id_atom()
                              ,client_id()
                              ,client_secret()
-                             ,#{}
+                             ,#{'request_opts' => kc_request_opts()}
                              )
                     end).
 
@@ -482,6 +710,10 @@ refresh_token(RefreshToken) ->
         %% забывать в refresh нельзя.
         Opts = #{'expected_subject' => ExpectedSub
                 ,'preferred_auth_methods' => preferred_auth_methods()
+                 %% Тот же потолок, что у `retrieve_token/3': mobile-клиент
+                 %% дёргает refresh на каждом cold-start, и при лежащем KC
+                 %% дефолтная минута oidcc копила бы занятые воркеры.
+                ,'request_opts' => kc_request_opts()
                 },
         Result =
             oidcc:refresh_token(

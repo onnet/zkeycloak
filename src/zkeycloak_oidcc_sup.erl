@@ -40,6 +40,13 @@ init([]) ->
 %% bogus-URL и черится в рестартах — поэтому отдаём пустой список детей,
 %% и `zkeycloak' стартует чисто. Реальных KC-токенов там нет → хук
 %% валидации всё равно короткозамкнут (`zkeycloak_util:is_configured/0').
+%%
+%% `MaxRestarts' выше НЕ трогаем осознанно: инцидент 29.07 показал, что
+%% intensity супервизора — не тот рычаг. Ребёнок падал на КАЖДОЙ ошибке
+%% дискавери, а `econnrefused' возвращается мгновенно ⇒ любой лимит выгорает
+%% за доли секунды. Лечится тем, что воркер ретраит САМ и не падает вовсе —
+%% см. `zkeycloak_util:discovery_worker_opts/0'. При включённом backoff'е
+%% супервизор рестартов от недоступности KC больше не видит в принципе.
 -spec oidcc_children() -> [supervisor:child_spec()].
 oidcc_children() ->
     case zkeycloak_util:is_configured() of
@@ -49,10 +56,19 @@ oidcc_children() ->
         'true' ->
             [#{'id' => 'oidcc_provider_configuration_worker'
               ,'start' => {'oidcc_provider_configuration_worker', 'start_link'
-                          ,[#{'issuer' => zkeycloak_util:issuer()
-                             ,'name' => {'local', zkeycloak_util:client_id_atom()}
-                             }]}
+                          ,[worker_opts()]}
               ,'shutdown' => 'brutal_kill'
               }]
     end.
+
+%% @doc Опции воркера: identity (issuer/name) + самовосстановление (backoff и
+%% таймаут HTTP-дискавери). Второе живёт в `zkeycloak_util', потому что там же
+%% лежит валидация значений из `kapps_config' и её EUnit.
+-spec worker_opts() -> map().
+worker_opts() ->
+    BackoffOpts = zkeycloak_util:discovery_worker_opts(),
+    lager:info("zkeycloak oidcc discovery worker opts: ~p", [BackoffOpts]),
+    BackoffOpts#{'issuer' => zkeycloak_util:issuer()
+                ,'name' => {'local', zkeycloak_util:client_id_atom()}
+                }.
 

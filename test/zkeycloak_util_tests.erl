@@ -576,3 +576,139 @@ redact_reason_recurses_into_class_reason_pair_test() ->
     R = zkeycloak_util:redact_reason(Reason),
     ?assertEqual('nomatch', binary:match(?FMT(R), <<"LIVE-SECRET">>)),
     ?assertMatch({'error', {'badmatch', _}}, R).
+
+%%%=============================================================================
+%%% backoff_opts/4 — самовосстановление oidcc discovery-воркера
+%%%
+%%% Инцидент 29.07.2026: воркер умирал на первой же ошибке дискавери
+%%% (`backoff_type = stop' — дефолт библиотеки), `econnrefused' приходит
+%%% мгновенно ⇒ лимит рестартов супервизора выгорал за доли секунды и дерево
+%%% `zkeycloak' оставалось мёртвым до ручного `restart_app'.
+%%%
+%%% Валидацию проверяем отдельно от `discovery_worker_opts/0' (тот читает
+%%% `kapps_config'): цена ошибки здесь — `function_clause' ВНУТРИ
+%%% `handle_continue' воркера, т.е. та же смерть, только уже без связи с
+%%% доступностью KC. Гарды, которые обязаны быть соблюдены:
+%%% `oidcc_backoff:handle_retry/4' — `Min > 0, Max > 0, Max >= Min';
+%%% `priv_handle_retry/4' — закрытый набор типов.
+%%%=============================================================================
+
+backoff_opts_valid_values_pass_through_test() ->
+    Opts = zkeycloak_util:backoff_opts('exponential', 500, 60000, 7000),
+    ?assertEqual('exponential', maps:get('backoff_type', Opts)),
+    ?assertEqual(500, maps:get('backoff_min', Opts)),
+    ?assertEqual(60000, maps:get('backoff_max', Opts)),
+    ?assertEqual(#{'request_opts' => #{'timeout' => 7000}}
+                ,maps:get('provider_configuration_opts', Opts)).
+
+backoff_opts_defaults_are_retrying_test() ->
+    %% Главное свойство: при дефолтах воркер РЕТРАИТ, а не умирает.
+    Opts = zkeycloak_util:backoff_opts('random_exponential', 1000, 30000, 10000),
+    ?assertNotEqual('stop', maps:get('backoff_type', Opts)),
+    ?assert(lists:member(maps:get('backoff_type', Opts)
+                        ,['exponential', 'random', 'random_exponential'])).
+
+backoff_opts_rejects_stop_type_test() ->
+    %% `stop' — валидное для библиотеки значение и её дефолт, но это ровно
+    %% инцидент 29.07 в чистом виде: конфигом его взвести нельзя.
+    Opts = zkeycloak_util:backoff_opts('stop', 1000, 30000, 10000),
+    ?assertNotEqual('stop', maps:get('backoff_type', Opts)),
+    ?assertEqual('random_exponential', maps:get('backoff_type', Opts)).
+
+backoff_opts_rejects_unknown_type_test() ->
+    %% Неизвестный атом дал бы `function_clause' в `priv_handle_retry/4'.
+    ?assertEqual('random_exponential'
+                ,maps:get('backoff_type'
+                         ,zkeycloak_util:backoff_opts('linear', 1000, 30000, 10000))),
+    ?assertEqual('random_exponential'
+                ,maps:get('backoff_type'
+                         ,zkeycloak_util:backoff_opts('undefined', 1000, 30000, 10000))).
+
+backoff_opts_rejects_inverted_bounds_test() ->
+    %% Ключевой случай: каждое значение по отдельности валидно (положительное
+    %% целое), но пара нарушает гард `Max >= Min' — раздельная проверка
+    %% пропустила бы её прямиком в `function_clause'.
+    Opts = zkeycloak_util:backoff_opts('random_exponential', 30000, 1000, 10000),
+    ?assertEqual(1000, maps:get('backoff_min', Opts)),
+    ?assertEqual(30000, maps:get('backoff_max', Opts)).
+
+backoff_opts_rejects_non_positive_bounds_test() ->
+    Zero = zkeycloak_util:backoff_opts('random_exponential', 0, 30000, 10000),
+    ?assertEqual(1000, maps:get('backoff_min', Zero)),
+    ?assertEqual(30000, maps:get('backoff_max', Zero)),
+    Negative = zkeycloak_util:backoff_opts('random_exponential', 1000, -1, 10000),
+    ?assertEqual(1000, maps:get('backoff_min', Negative)),
+    ?assertEqual(30000, maps:get('backoff_max', Negative)).
+
+backoff_opts_rejects_non_integer_bounds_test() ->
+    %% `kapps_config:get_integer/3' отдаёт `undefined', если в документе лежит
+    %% не-число (руками правленный конфиг) — гард обязан это пережить.
+    Opts = zkeycloak_util:backoff_opts('random_exponential', 'undefined', 'undefined', 10000),
+    ?assertEqual(1000, maps:get('backoff_min', Opts)),
+    ?assertEqual(30000, maps:get('backoff_max', Opts)).
+
+backoff_opts_rejects_bad_request_timeout_test() ->
+    %% `0'/отрицательный httpc трактует как «уже истёк», `infinity' вернул бы
+    %% блокировку gen_server'а на неопределённый срок — обе формы отвергаем.
+    Expected = #{'request_opts' => #{'timeout' => 10000}},
+    ?assertEqual(Expected
+                ,maps:get('provider_configuration_opts'
+                         ,zkeycloak_util:backoff_opts('random_exponential', 1000, 30000, 0))),
+    ?assertEqual(Expected
+                ,maps:get('provider_configuration_opts'
+                         ,zkeycloak_util:backoff_opts('random_exponential', 1000, 30000, 'infinity'))),
+    ?assertEqual(Expected
+                ,maps:get('provider_configuration_opts'
+                         ,zkeycloak_util:backoff_opts('random_exponential', 1000, 30000, 'undefined'))).
+
+%%%=============================================================================
+%%% is_provider_unavailable/1 — «провайдер недоступен» против «плохие креды»
+%%%=============================================================================
+
+is_provider_unavailable_true_forms_test() ->
+    %% штатный ответ oidcc_client_context: воркер мёртв либо ещё не загрузился
+    ?assert(zkeycloak_util:is_provider_unavailable('provider_not_ready')),
+    %% воркер ЖИВ, но занят HTTP-попыткой; oidcc зовёт его gen_server:call с 5 s
+    ?assert(zkeycloak_util:is_provider_unavailable(
+              {'exit', {'timeout', {'gen_server', 'call'
+                                   ,['onbill_client', 'get_provider_configuration']}}})),
+    %% воркер умер между whereis и gen_server:call
+    ?assert(zkeycloak_util:is_provider_unavailable(
+              {'exit', {'noproc', {'gen_server', 'call'
+                                  ,['onbill_client', 'get_jwks']}}})).
+
+is_provider_unavailable_true_for_dead_keycloak_test() ->
+    %% ВТОРАЯ группа форм, которую легко упустить: обмен кода идёт не только
+    %% через discovery-воркер — `oidcc_token'/`oidcc_userinfo' ходят в KC САМИ,
+    %% и `oidcc_http_util:request/4' НИКОГДА не бросает исключение: транспортный
+    %% сбой возвращается обычным `{error, Reason}' (oidcc_http_util.erl:128).
+    %% Т.е. эти формы приезжают по НЕ-catch ветке `normalize_oidcc/2', сырыми,
+    %% и без клозов ниже мапились бы в 401 «неверные креды» при попросту
+    %% лежащем Keycloak — ровно та ложь, которую план и устраняет.
+    ?assert(zkeycloak_util:is_provider_unavailable('timeout')),
+    ?assert(zkeycloak_util:is_provider_unavailable('socket_closed_remotely')),
+    %% ровно та форма, что видели в инциденте 29.07
+    ?assert(zkeycloak_util:is_provider_unavailable(
+              {'failed_connect', [{'to_address', {"keycloak.brterminal.ru", 443}}
+                                 ,{'inet', ['inet'], 'econnrefused'}
+                                 ]})),
+    %% KC жив по TCP, но не обслуживает (прокси в окно рестарта KC)
+    ?assert(zkeycloak_util:is_provider_unavailable({'http_error', 502, <<"Bad Gateway">>})),
+    ?assert(zkeycloak_util:is_provider_unavailable({'http_error', 503, <<>>})),
+    ?assert(zkeycloak_util:is_provider_unavailable({'http_error', 504, <<>>})).
+
+is_provider_unavailable_false_for_credential_errors_test() ->
+    %% Ежедневный invalid_grant (протухший/использованный code) — это НЕ
+    %% недоступность провайдера, ответ должен остаться 401.
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'http_error', 400, <<"invalid_grant">>})),
+    %% Порог 5xx обязан быть строгим: 4xx — это отказ АУТЕНТИФИКАЦИИ, и утащить
+    %% его в 503 значило бы замаскировать реальный invalid_grant под инфра-сбой
+    %% (зеркальная ошибка той, что чиним).
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'http_error', 401, <<>>})),
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'http_error', 403, <<>>})),
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'http_error', 499, <<>>})),
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'missing_claim', <<"nonce">>, '$redacted'})),
+    ?assertNot(zkeycloak_util:is_provider_unavailable('token_expired')),
+    %% `error'-класс (не `exit') — это краш нашего кода, не недоступность KC
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'error', 'badarg'})),
+    ?assertNot(zkeycloak_util:is_provider_unavailable({'badmatch', <<"whatever">>})).

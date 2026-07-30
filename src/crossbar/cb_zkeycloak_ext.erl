@@ -32,6 +32,18 @@
 -define(REFRESH, <<"refresh">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
+%% @doc Отдельный системный отказ для «OIDC-провайдер недоступен» — НЕ 401 и
+%% НЕ 500 (инцидент 29.07). 401 `invalid_credentials' на этом классе прямо
+%% вреден: он говорит клиенту «креды плохие», и портал начинал авторизацию
+%% заново, переиспользуя тот же одноразовый `code' (в логах KC —
+%% `Code '<uuid>' already used', 14 повторов). 503 — «инфраструктура, повтори
+%% позже»; отдельный `error'-тег (а не переиспользованный
+%% `datastore_unreachable', который тоже 503) нужен, чтобы клиент отличал
+%% недоступный Keycloak от недоступного CouchDB.
+-define(PROVIDER_UNAVAILABLE_CODE, 503).
+-define(PROVIDER_UNAVAILABLE_ERROR, 'oidc_provider_unavailable').
+-define(PROVIDER_UNAVAILABLE_MSG, <<"identity provider is not available, retry later">>).
+
 -spec init() -> ok.
 init() ->
     _ = crossbar_bindings:bind(<<"*.authenticate.zkeycloak_ext">>, ?MODULE, 'authenticate'),
@@ -169,9 +181,9 @@ validate(Context, ?AUTH_LINK) ->
     QS = cb_context:query_string(Context),
     CodeChallenge = kz_json:get_ne_binary_value(<<"code_challenge">>, QS),
     lager:info("validate_ext/2  auth_link: has_code_challenge=~p", [CodeChallenge =/= 'undefined']),
-    AuthUrl = zkeycloak_util:auth_url(CodeChallenge),
-    JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),
-    cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+    %% `auth_url/1' нормализован к {ok,_}|{error,_} (инцидент 29.07): раньше не
+    %% готовый discovery-воркер давал badmatch и Crossbar-500 на ручке логина.
+    respond_with_auth_url(Context, <<"auth_link">>, zkeycloak_util:auth_url(CodeChallenge));
 validate(Context, ?AUTH_CALLBACK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
     lager:info("validate_ext/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
@@ -224,7 +236,11 @@ validate(Context, ?AUTH_CALLBACK) ->
             %% встроенное в `{badmatch,V}'/… значение (claim-байты) — чистим.
             lager:info("validate_ext/2  auth_callback: token exchange failed ~p"
                       ,[zkeycloak_util:redact_reason(Reason)]),
-            cb_context:add_system_error('invalid_credentials', Context);
+            %% Инцидент 29.07: «дискавери-провайдер не готов» — это НЕ «клиент
+            %% прислал плохие креды». Под 401 портал начинал авторизацию заново
+            %% с тем же одноразовым `code' (KC: `Code '<uuid>' already used',
+            %% 14 повторов) и залипал намертво. Отдаём 503 — «повтори позже».
+            provider_error(Context, <<"auth_callback">>, Reason, 'invalid_credentials');
         Other ->
             %% P3 (кросс-ревью 18.07): `Other' здесь — `{ok,<нестандартная
             %% форма>}' (retrieve_token нормализован к {ok,_}|{error,_}), т.е.
@@ -255,9 +271,8 @@ validate(Context, ?KERBEROS_LOGIN) ->
                 'undefined' -> PromptOpts;
                 _ -> PromptOpts#{'code_challenge' => CodeChallenge}
             end,
-            AuthUrl = zkeycloak_util:kerberos_auth_url(ExtraOpts),
-            JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),
-            cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+            respond_with_auth_url(Context, <<"kerberos_login">>
+                                 ,zkeycloak_util:kerberos_auth_url(ExtraOpts));
         'false' ->
             cb_context:add_system_error('forbidden', Context)
     end;
@@ -318,6 +333,56 @@ validate(Context, ?ZKEYCLOAK) ->
 %%%=============================================================================
 
 %%------------------------------------------------------------------------------
+%% @doc Ответ ручек, отдающих /authorize-URL (`auth_link', `kerberos_login').
+%% `zkeycloak_util:auth_url/1'/`kerberos_auth_url/1' нормализованы к
+%% `{ok,_} | {error,_}'; до инцидента 29.07 они матчились жёстко, и не готовый
+%% discovery-воркер ронял ручку логина в Crossbar-500.
+%%
+%% Fallback здесь `unspecified_fault' (500), а НЕ `invalid_credentials': на этих
+%% ручках клиент никаких кредов не предъявляет, и «401» был бы враньём — сбой
+%% построения URL это наша серверная проблема (дрейф формы oidcc, кривой конфиг
+%% клиента), а не проблема пользователя.
+%% @end
+%%------------------------------------------------------------------------------
+-spec respond_with_auth_url(cb_context:context()
+                           ,kz_term:ne_binary()
+                           ,{'ok', kz_term:ne_binary()} | {'error', any()}
+                           ) -> cb_context:context().
+respond_with_auth_url(Context, _Tag, {'ok', AuthUrl}) ->
+    JObj = kz_json:set_value(<<"auth_url">>, AuthUrl, kz_json:new()),
+    cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+respond_with_auth_url(Context, Tag, {'error', Reason}) ->
+    lager:warning("validate_ext/2 ~s: auth url build failed ~p"
+                 ,[Tag, zkeycloak_util:redact_reason(Reason)]),
+    provider_error(Context, Tag, Reason, 'unspecified_fault').
+
+%%------------------------------------------------------------------------------
+%% @doc Разложить отказ oidcc на «провайдер недоступен» (503, ждать) и всё
+%% остальное (`Fallback' — как было до инцидента 29.07). Классификатор живёт в
+%% `zkeycloak_util:is_provider_unavailable/1' — там же его EUnit и там же
+%% перечислены все три наблюдаемые формы отказа.
+%% @end
+%%------------------------------------------------------------------------------
+-spec provider_error(cb_context:context()
+                    ,kz_term:ne_binary()
+                    ,any()
+                    ,atom()
+                    ) -> cb_context:context().
+provider_error(Context, Tag, Reason, Fallback) ->
+    case zkeycloak_util:is_provider_unavailable(Reason) of
+        'true' ->
+            lager:warning("zkeycloak ~s: oidc provider unavailable (~p) — replying ~p"
+                         ,[Tag, zkeycloak_util:redact_reason(Reason), ?PROVIDER_UNAVAILABLE_CODE]),
+            cb_context:add_system_error(?PROVIDER_UNAVAILABLE_CODE
+                                       ,?PROVIDER_UNAVAILABLE_ERROR
+                                       ,?PROVIDER_UNAVAILABLE_MSG
+                                       ,Context
+                                       );
+        'false' ->
+            cb_context:add_system_error(Fallback, Context)
+    end.
+
+%%------------------------------------------------------------------------------
 %% @doc
 %% @end
 %%------------------------------------------------------------------------------
@@ -369,7 +434,12 @@ handle_refresh(Context, RefreshToken) ->
             %% `Reason' из refresh_token/1 чистим (встроенное значение краша).
             lager:info("handle_refresh: KC error ~p — invalid_grant flow"
                       ,[zkeycloak_util:redact_reason(Reason)]),
-            cb_context:add_system_error('invalid_credentials', Context);
+            %% Инцидент 29.07: и здесь «провайдер недоступен» отделяем от
+            %% «refresh протух». Под 401 mobile-клиент выбрасывал ВАЛИДНЫЙ
+            %% 30-дневный refresh и уходил в полный AppAuth-flow, который при
+            %% мёртвом провайдере тоже не проходит; 503 честнее и позволяет
+            %% просто повторить позже.
+            provider_error(Context, <<"refresh">>, Reason, 'invalid_credentials');
         Other ->
             %% P3 (кросс-ревью 18.07): `Other' — `{ok,<нестандартная форма>}'
             %% (refresh_token нормализован), дрейф формы с живыми токенами.
@@ -434,7 +504,10 @@ authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, Mod
             %% Сырой `~p' лил её в лог — чистим через redact_reason/1.
             lager:info("authorize_and_issue[~p]  retrieve_userinfo failed ~p"
                       ,[Mode, zkeycloak_util:redact_reason(Reason)]),
-            cb_context:add_system_error('invalid_credentials', Context)
+            %% Инцидент 29.07: userinfo идёт через тот же discovery-воркер, и
+            %% его неготовность даёт здесь ровно тот же `provider_not_ready'.
+            %% 401 на этом месте так же вводил бы клиента в заблуждение.
+            provider_error(Context, <<"retrieve_userinfo">>, Reason, 'invalid_credentials')
     end.
 
 -spec provide_keycloak_token(cb_context:context()
