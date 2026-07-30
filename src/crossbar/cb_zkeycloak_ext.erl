@@ -630,26 +630,14 @@ account_id_claim(UserInfoMap) ->
             {AccountId, ?ACCOUNT_ID_CLAIM}
     end.
 
-%% @doc raw-account-id это ровно 32 hex-байта — единственная форма, которую
-%% (а) реально шлёт SPI-claim `handleKazooAuth' и (б) `kzs_util:format_account_id/2'
-%% превращает в СУЩЕСТВУЮЩИЙ db-путь. `?MATCH_ACCOUNT_RAW' проверяет только
-%% ДЛИНУ (32 байта) — 32-байтный не-hex прошёл бы её и упал бы 503 ниже;
-%% hex-предикат добавляет недостающую проверку алфавита (P3 кросс-ревью 18.07
-%% волна 2). Не-binary / не-32-байтные формы (`undefined'/`<<>>'/малформ) →
-%% `false' → чистый 401 (сохраняет поведение issue 10 / P3-2).
+%% @doc raw-account-id это ровно 32 hex-байта (проверка длины И алфавита;
+%% обоснование — у `zkeycloak_util:is_raw_account_id/1', куда хелпер
+%% перенесён в G-3 Ф1: он нужен и на пути валидации сырого KC-токена).
+%% Не-binary / не-32-байтные формы (`undefined'/`<<>>'/малформ) → `false'
+%% → чистый 401 (сохраняет поведение issue 10 / P3-2).
 -spec is_raw_account_id(any()) -> boolean().
-is_raw_account_id(?MATCH_ACCOUNT_RAW(AccountId)) -> is_hex(AccountId);
-is_raw_account_id(_) -> 'false'.
-
--spec is_hex(binary()) -> boolean().
-is_hex(B) ->
-    lists:all(fun is_hex_char/1, binary_to_list(B)).
-
--spec is_hex_char(byte()) -> boolean().
-is_hex_char(C) when C >= $0, C =< $9 -> 'true';
-is_hex_char(C) when C >= $a, C =< $f -> 'true';
-is_hex_char(C) when C >= $A, C =< $F -> 'true';
-is_hex_char(_) -> 'false'.
+is_raw_account_id(AccountId) ->
+    zkeycloak_util:is_raw_account_id(AccountId).
 
 -spec provide_keycloak_token(cb_context:context()
                             ,kz_term:ne_binary()

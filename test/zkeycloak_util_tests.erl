@@ -712,3 +712,158 @@ is_provider_unavailable_false_for_credential_errors_test() ->
     %% `error'-класс (не `exit') — это краш нашего кода, не недоступность KC
     ?assertNot(zkeycloak_util:is_provider_unavailable({'error', 'badarg'})),
     ?assertNot(zkeycloak_util:is_provider_unavailable({'badmatch', <<"whatever">>})).
+
+%%%=============================================================================
+%%% validate_subject_enabled/1 — enabled-гейт сырого KC-токена (G-3 Ф1,
+%%% план 2026-07-31-activity-audit-track.md)
+%%%
+%%% До гейта сырой KC access-токен валидировался МИМО user-doc'а:
+%%% деактивированный (`enabled=false') сохранял доступ ко всем ручкам
+%%% crossbar/zmcp до конца жизни KC-токена, и G-2-отзыв на него не
+%%% действует. Семантика — как G-1 на выдаче: док без поля `enabled' =
+%%% активный; всё нерезолвящееся/нечитаемое — отказ (fail-closed).
+%%%
+%%% Границу `kz_datamgr' мокаем (не наш модуль, cover не страдает);
+%%% путь от claims до неё — чистый.
+%%%=============================================================================
+
+-define(GATE_SUB, <<"fedcba98-7654-3210-fedc-ba9876543210">>).
+-define(GATE_OWNER_ID, <<"fedcba9876543210fedcba9876543210">>).
+-define(GATE_ACCOUNT_ID, <<"0123456789abcdef0123456789abcdef">>).
+-define(GATE_ACCOUNT_DB, <<"account%2F01%2F23%2F456789abcdef0123456789abcdef">>).
+-define(GATE_CLAIMS, [{<<"sub">>, ?GATE_SUB}
+                     ,{<<"account_id">>, ?GATE_ACCOUNT_ID}
+                     ]).
+-define(GATE_ENABLED_DOC, kz_json:from_list([{<<"enabled">>, 'true'}])).
+-define(GATE_DISABLED_DOC, kz_json:from_list([{<<"enabled">>, 'false'}])).
+
+subject_enabled_gate_test_() ->
+    {'setup', fun gate_setup/0, fun gate_cleanup/1,
+     fun(_) ->
+             [{"enabled=true → onbill_access_provided; читаем ИМЕННО"
+               " encoded-db аккаунта из claim'а (open_cache_doc — путь горячий)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(Db, Id) ->
+                                           ?assertEqual(?GATE_ACCOUNT_DB, Db),
+                                           ?assertEqual(?GATE_OWNER_ID, Id),
+                                           {'ok', ?GATE_ENABLED_DOC}
+                                   end),
+                       ?assertEqual({'ok', 'onbill_access_provided'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"поля enabled нет → активный (дефолт kzd_users:enabled/1, как G-1)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+                       ?assertEqual({'ok', 'onbill_access_provided'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"enabled=false → user_disabled: живой KC-токен деактивированного"
+               " больше не проходит валидацию",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'ok', ?GATE_DISABLED_DOC} end),
+                       ?assertEqual({'error', 'user_disabled'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"дока нет → kc_user_doc_missing (JIT-создания на валидации нет)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'error', 'not_found'} end),
+                       ?assertEqual({'error', 'kc_user_doc_missing'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"datastore-сбой → datastore_unreachable, НЕ пропуск (fail-closed;"
+               " транспортно это тоже 401 — cb_token_auth схлопывает error в decline)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'error', 'timeout'} end),
+                       ?assertEqual({'error', 'datastore_unreachable'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"sub не KIS-derived uuid → kc_subject_not_kis, до datastore не доходим",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> erlang:error('unexpected_datamgr_call') end),
+                       Claims = [{<<"sub">>, <<"service-account-robot">>}
+                                ,{<<"account_id">>, ?GATE_ACCOUNT_ID}
+                                ],
+                       ?assertEqual({'error', 'kc_subject_not_kis'},
+                                    zkeycloak_util:validate_subject_enabled(Claims))
+               end}
+             ,{"sub отсутствует → kc_subject_not_kis (from_key от undefined)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> erlang:error('unexpected_datamgr_call') end),
+                       ?assertEqual({'error', 'kc_subject_not_kis'},
+                                    zkeycloak_util:validate_subject_enabled(
+                                      [{<<"account_id">>, ?GATE_ACCOUNT_ID}]))
+               end}
+             ,{"нет НИ account_id, НИ default_account_id → kc_account_claim_invalid,"
+               " до datastore не доходим",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> erlang:error('unexpected_datamgr_call') end),
+                       ?assertEqual({'error', 'kc_account_claim_invalid'},
+                                    zkeycloak_util:validate_subject_enabled(
+                                      [{<<"sub">>, ?GATE_SUB}]))
+               end}
+             ,{"ноты account_id нет → фолбэк default_account_id"
+               " (LDAP/Kerberos-субъект, как в cb_zkeycloak_ext:account_id_claim/1)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(Db, _Id) ->
+                                           ?assertEqual(?GATE_ACCOUNT_DB, Db),
+                                           {'ok', ?GATE_ENABLED_DOC}
+                                   end),
+                       Claims = [{<<"sub">>, ?GATE_SUB}
+                                ,{<<"default_account_id">>, ?GATE_ACCOUNT_ID}
+                                ],
+                       ?assertEqual({'ok', 'onbill_access_provided'},
+                                    zkeycloak_util:validate_subject_enabled(Claims))
+               end}
+             ,{"нота account_id = null → тоже фолбэк на default_account_id",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'ok', ?GATE_ENABLED_DOC} end),
+                       Claims = [{<<"sub">>, ?GATE_SUB}
+                                ,{<<"account_id">>, 'null'}
+                                ,{<<"default_account_id">>, ?GATE_ACCOUNT_ID}
+                                ],
+                       ?assertEqual({'ok', 'onbill_access_provided'},
+                                    zkeycloak_util:validate_subject_enabled(Claims))
+               end}
+             ,{"МАЛФОРМНАЯ нота account_id → отказ БЕЗ фолбэка даже при валидном"
+               " default_account_id (семантика cb_zkeycloak_ext сохранена)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> erlang:error('unexpected_datamgr_call') end),
+                       Claims = [{<<"sub">>, ?GATE_SUB}
+                                ,{<<"account_id">>, <<"junk">>}
+                                ,{<<"default_account_id">>, ?GATE_ACCOUNT_ID}
+                                ],
+                       ?assertEqual({'error', 'kc_account_claim_invalid'},
+                                    zkeycloak_util:validate_subject_enabled(Claims))
+               end}
+             ,{"account_id 32 байта, но не hex → kc_account_claim_invalid"
+               " (is_raw_account_id проверяет и алфавит)",
+               fun() ->
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> erlang:error('unexpected_datamgr_call') end),
+                       Claims = [{<<"sub">>, ?GATE_SUB}
+                                ,{<<"account_id">>, <<"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz">>}
+                                ],
+                       ?assertEqual({'error', 'kc_account_claim_invalid'},
+                                    zkeycloak_util:validate_subject_enabled(Claims))
+               end}
+             ]
+     end}.
+
+gate_setup() ->
+    meck:new('kz_datamgr', ['no_link']),
+    'ok'.
+
+gate_cleanup(_) ->
+    _ = (catch meck:unload('kz_datamgr')),
+    'ok'.

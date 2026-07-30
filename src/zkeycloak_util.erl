@@ -22,6 +22,7 @@
         ,jwt_iss/1
         ,maybe_keycloak_token/1
         ,maybe_keycloak_token_validate/2
+        ,is_raw_account_id/1
         ,kerberos_enabled/0
         ,kerberos_idp_hint/0
         ,kerberos_auth_url/0
@@ -54,7 +55,13 @@
 %% валидация вынесена отдельной чистой функцией именно чтобы её можно было
 %% покрыть тестами без мока конфига.
 -export([backoff_opts/4]).
+%% G-3 Ф1: enabled-гейт субъекта сырого KC-токена — открыт для EUnit,
+%% чтобы тестировать от claims до `kz_datamgr'-границы (её мокаем),
+%% не собирая живой подписанный JWT ради `decode_safe'.
+-export([validate_subject_enabled/1]).
 -endif.
+
+-include_lib("kazoo_stdlib/include/kz_types.hrl").
 
 %% @doc HTTP-заголовки, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми: несут
 %% живой Bearer-токен (`authorization'), Kazoo auth-token (`x-auth-token'),
@@ -1357,13 +1364,126 @@ validate_onbill_access(Token) ->
             ResourceAccess = props:get_value(<<"resource_access">>, Claims, #{}),
             ClientRoles = kz_maps:get([<<"onbill_client">>, <<"roles">>], ResourceAccess, []),
             case lists:member(<<"onbill_access">>, ClientRoles) of
-                'true' -> {'ok', 'onbill_access_provided'};
+                'true' -> validate_subject_enabled(Claims);
                 'false' -> {'error', 'onbill_access_absent'}
             end;
         {'error', Reason} ->
             lager:debug("keycloak token rejected: ~p", [Reason]),
             {'error', Reason}
     end.
+
+%% @doc G-3 Ф1 (P1-санитария, план `2026-07-31-activity-audit-track.md'):
+%% enabled-гейт субъекта СЫРОГО KC access-токена на пути валидации. До
+%% гейта такой токен проходил МИМО user-doc'а (роль-гейт выше + подпись в
+%% `kz_auth' — и всё): деактивированный пользователь сохранял доступ ко
+%% всем ручкам crossbar/zmcp, пока мог предъявлять KC-токен. G-2-отзыв
+%% (`pvt_signature_secret') на этот класс токенов не действует — у них нет
+%% `identity_sig'; деактивация KC-учётку в Keycloak не трогает, так что
+%% «до конца KC-сессии» ничем не ограничено. Этот гейт — единственный
+%% барьер.
+%%
+%% Семантика — симметрично G-1 на выдаче (`cb_zkeycloak_ext:
+%% user_enabled_gate/1'): док без поля `enabled' = активный. Fail-closed
+%% целиком: нерезолвящийся `sub', малформный `account_id'-claim,
+%% отсутствующий док, datastore-сбой — отказ. Транспортного различения
+%% 401/503 на пути валидации НЕТ — `cb_token_auth' схлопывает любой
+%% `{error,_}' в decline (центральный 401 от `api_util:is_authentic');
+%% различение остаётся в атомах причин и warning-логах для оператора.
+%%
+%% Чтение через `open_cache_doc' — путь горячий (каждый запрос с
+%% KC-токеном, в отличие от редкого refresh G-1); деактивация инвалидирует
+%% кэш штатно (save_doc в `cb_users'/zmdm публикует doc-change → flush по
+%% origin), плюс G-2 в тех же точках уже отзывает kazoo-токены.
+-spec validate_subject_enabled(kz_term:proplist()) ->
+          {'ok', 'onbill_access_provided'} | {'error', any()}.
+validate_subject_enabled(Claims) ->
+    case zcore_util:from_key(props:get_value(<<"sub">>, Claims), 'undefined') of
+        'undefined' ->
+            %% значение claim'а в лог не пишем (дисциплина модуля: без
+            %% сырых claim'ов в логах) — как в G-1-отказе по sub.
+            lager:info("kc token validation: sub is not a KIS-derived uuid"
+                       " (LDAP/service-account/federated subject?), rejecting"),
+            {'error', 'kc_subject_not_kis'};
+        OwnerId ->
+            validate_subject_enabled(Claims, OwnerId)
+    end.
+
+-spec validate_subject_enabled(kz_term:proplist(), kz_term:ne_binary()) ->
+          {'ok', 'onbill_access_provided'} | {'error', any()}.
+validate_subject_enabled(Claims, OwnerId) ->
+    {AccountId, ClaimUsed} = account_id_claim(Claims),
+    case is_raw_account_id(AccountId) of
+        'false' ->
+            lager:info("kc token validation: ~s claim malformed or absent, rejecting",
+                       [ClaimUsed]),
+            {'error', 'kc_account_claim_invalid'};
+        'true' ->
+            user_enabled_gate(kzs_util:format_account_id(AccountId, 'encoded'), OwnerId)
+    end.
+
+%% @doc Резолв аккаунта из claims access-токена — тот же паттерн, что
+%% `cb_zkeycloak_ext:account_id_claim/1' над userinfo (review-loop Ф1,
+%% находка №1): примари — SPI-нота `account_id' (`handleKazooAuth');
+%% фолбэк на `default_account_id' (hardcoded-маппер `onbill_scope') ТОЛЬКО
+%% при полном отсутствии ноты (`undefined'/`null') — это единственный
+%% источник аккаунта для LDAP/Kerberos-субъектов, которым SPI нот не
+%% пишет. При МАЛФОРМНОЙ ноте фолбэка нет — малформ отклоняется выше по
+%% `is_raw_account_id/1'. Судьбу токена без валидного аккаунта дальше
+%% решал бы `kz_auth:validate_claims/2' — гейт не расширяет и не сужает
+%% класс принимаемых токенов, он только добавляет enabled-проверку.
+-spec account_id_claim(kz_term:proplist()) -> {any(), kz_term:ne_binary()}.
+account_id_claim(Claims) ->
+    case props:get_value(<<"account_id">>, Claims) of
+        Absent when Absent =:= 'undefined'; Absent =:= 'null' ->
+            {props:get_value(<<"default_account_id">>, Claims), <<"default_account_id">>};
+        AccountId -> {AccountId, <<"account_id">>}
+    end.
+
+-spec user_enabled_gate(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          {'ok', 'onbill_access_provided'} | {'error', any()}.
+user_enabled_gate(DbName, OwnerId) ->
+    case kz_datamgr:open_cache_doc(DbName, OwnerId) of
+        {'ok', UserDoc} ->
+            case kzd_users:enabled(UserDoc) of
+                'true' -> {'ok', 'onbill_access_provided'};
+                'false' ->
+                    lager:warning("kc token validation: subject ~s is disabled, rejecting", [OwnerId]),
+                    {'error', 'user_disabled'}
+            end;
+        {'error', 'not_found'} ->
+            %% сырой KC-токен юзера, которого не провижнили через
+            %% login-обмен (`cb_zkeycloak_ext' JIT-создаёт док) — отказ;
+            %% JIT-создание на пути ВАЛИДАЦИИ намеренно не делаем.
+            lager:warning("kc token validation: subject ~s has no user-doc in ~s, rejecting",
+                          [OwnerId, DbName]),
+            {'error', 'kc_user_doc_missing'};
+        {'error', OpenErr} ->
+            lager:warning("kc token validation: datastore error reading ~s/~s: ~p,"
+                          " rejecting (fail-closed)",
+                          [DbName, OwnerId, OpenErr]),
+            {'error', 'datastore_unreachable'}
+    end.
+
+%% @doc raw-account-id — ровно 32 hex-байта: единственная форма, которую
+%% (а) реально шлёт SPI-claim `handleKazooAuth' и (б) `kzs_util:
+%% format_account_id/2' превращает в валидный db-путь. `?MATCH_ACCOUNT_RAW'
+%% проверяет только ДЛИНУ (32 байта) — hex-предикат добавляет проверку
+%% алфавита (P3 кросс-ревью 18.07 волна 2). Не-binary / не-32-байтные
+%% формы (`undefined'/`<<>>'/малформ) → `false'. Перенесено из
+%% `cb_zkeycloak_ext' в G-3 Ф1: нужен и на пути валидации сырого токена.
+-spec is_raw_account_id(any()) -> boolean().
+is_raw_account_id(?MATCH_ACCOUNT_RAW(AccountId)) -> is_hex(AccountId);
+is_raw_account_id(_) -> 'false'.
+
+-spec is_hex(binary()) -> boolean().
+is_hex(B) ->
+    lists:all(fun is_hex_char/1, binary_to_list(B)).
+
+-spec is_hex_char(byte()) -> boolean().
+is_hex_char(C) when C >= $0, C =< $9 -> 'true';
+is_hex_char(C) when C >= $a, C =< $f -> 'true';
+is_hex_char(C) when C >= $A, C =< $F -> 'true';
+is_hex_char(_) -> 'false'.
 
 %% @doc Определяет, как именно KC аутентифицировал пользователя.
 %% Маркеры Kerberos: `acr=kerberos' (broker IdP flow) или присутствие
