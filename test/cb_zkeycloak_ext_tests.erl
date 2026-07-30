@@ -27,6 +27,9 @@
 -define(OWNER_ID, <<"0123456789abcdef0123456789abcdef">>).
 %% raw-account-id: ровно 32 байта.
 -define(ACCOUNT_ID, <<"fedcba9876543210fedcba9876543210">>).
+%% Аккаунт из hardcoded-маппера скоупа (`default_account_id') — заведомо ДРУГОЙ,
+%% иначе тест на приоритет ноты был бы вакуумным.
+-define(DEFAULT_ACCOUNT_ID, <<"00112233445566778899aabbccddeeff">>).
 
 -define(TA, <<"dummy-access-token">>).
 -define(TID, <<"dummy-id-token">>).
@@ -83,6 +86,77 @@ account_gate_rejects_32byte_non_hex_test() ->
     Ctx = cb_zkeycloak_ext:provide_keycloak_token(
             cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login', ?OWNER_ID),
     assert_401(Ctx).
+
+account_gate_rejects_malformed_note_even_with_valid_default_test() ->
+    %% Дефект R1, шаг 3.1: фолбэка на `default_account_id' при БИТОЙ ноте нет.
+    %% Молча увести пользователя с малформной нотой в общий дефолтный аккаунт
+    %% хуже, чем отдать чистый 401 — 401 виден, чужой аккаунт нет.
+    UserInfo = #{<<"account_id">> => <<"not-a-valid-account-id">>
+                ,<<"default_account_id">> => ?DEFAULT_ACCOUNT_ID
+                },
+    Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+            cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login', ?OWNER_ID),
+    assert_401(Ctx).
+
+%%%=============================================================================
+%%% Приоритет claim'ов `account_id' vs `default_account_id' (дефект R1, шаг 3.1)
+%%%
+%%% В realm'е на claim `account_id' претендовали два маппера (hardcoded-константа
+%%% скоупа и session-note клиента), а порядок их применения в Keycloak при равном
+%%% приоритете — хеш-порядок UUID'ов мапперов, т.е. может перевернуться молча.
+%%% Фикс разводит claim'ы, и приоритет задаётся здесь, кодом: нота сильнее
+%%% константы. Эти тесты проверяют РЕЗУЛЬТАТ резолва — какой account_id уехал в
+%%% auth-doc, — а не только код ответа.
+%%%=============================================================================
+
+account_claim_precedence_test_() ->
+    {setup, fun setup_echo_doc/0, fun cleanup_boundaries/1,
+     fun(_) ->
+             [{"ноты нет → берём default_account_id (LDAP/Kerberos-субъект)",
+               fun() ->
+                       UserInfo = #{<<"default_account_id">> => ?DEFAULT_ACCOUNT_ID},
+                       ?assertEqual(?DEFAULT_ACCOUNT_ID, resolved_account_id(UserInfo))
+               end}
+             ,{"нота сильнее константы (вход аккаунтом портала)",
+               fun() ->
+                       UserInfo = #{<<"account_id">> => ?ACCOUNT_ID
+                                   ,<<"default_account_id">> => ?DEFAULT_ACCOUNT_ID
+                                   },
+                       ?assertEqual(?ACCOUNT_ID, resolved_account_id(UserInfo))
+               end}
+             ,{"JSON null в ноте = ноты нет → фолбэк",
+               fun() ->
+                       UserInfo = #{<<"account_id">> => 'null'
+                                   ,<<"default_account_id">> => ?DEFAULT_ACCOUNT_ID
+                                   },
+                       ?assertEqual(?DEFAULT_ACCOUNT_ID, resolved_account_id(UserInfo))
+               end}
+             ,{"нота без константы работает как раньше (до правки realm'а)",
+               fun() ->
+                       UserInfo = #{<<"account_id">> => ?ACCOUNT_ID},
+                       ?assertEqual(?ACCOUNT_ID, resolved_account_id(UserInfo))
+               end}
+             ]
+     end}.
+
+%% @doc Прогнать `provide_keycloak_token/7' и вернуть `account_id', который
+%% уехал в auth-doc. Через resp_data — его эхом отдаёт мок `crossbar_auth'.
+resolved_account_id(UserInfo) ->
+    Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+            cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login', ?OWNER_ID),
+    ?assertEqual('success', cb_context:resp_status(Ctx)),
+    kz_json:get_value(<<"account_id">>, cb_context:resp_data(Ctx)).
+
+setup_echo_doc() ->
+    'ok' = setup_boundaries(),
+    %% В отличие от `setup_boundaries/0' мок возвращает САМ auth-doc — иначе
+    %% результат резолва claim'а из теста не виден вообще.
+    meck:expect('crossbar_auth', 'create_auth_token',
+                fun(Ctx, _AuthModule) ->
+                        cb_context:set_resp_status(
+                          cb_context:set_resp_data(Ctx, cb_context:doc(Ctx)), 'success')
+                end),
+    'ok'.
 
 %%%=============================================================================
 %%% Валидный login-флоу через оба гейта (границы замоканы)

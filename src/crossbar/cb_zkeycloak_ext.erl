@@ -32,6 +32,12 @@
 -define(REFRESH, <<"refresh">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
+%% Claim'ы Kazoo-аккаунта: основной — user session note от `handleKazooAuth',
+%% фолбэк — константа hardcoded-маппера скоупа `onbill_scope' для субъектов без
+%% нот (LDAP/Kerberos). Обоснование и порядок раскатки — в `account_id_claim/1'.
+-define(ACCOUNT_ID_CLAIM, <<"account_id">>).
+-define(DEFAULT_ACCOUNT_ID_CLAIM, <<"default_account_id">>).
+
 %% @doc Отдельный системный отказ для «OIDC-провайдер недоступен» — НЕ 401 и
 %% НЕ 500 (инцидент 29.07). 401 `invalid_credentials' на этом классе прямо
 %% вреден: он говорит клиенту «креды плохие», и портал начинал авторизацию
@@ -548,7 +554,8 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap, Mode, OwnerId) ->
     %% issue 10 + P3 (кросс-ревью 16.07): claim `account_id' ставит только
-    %% SPI-путь `handleKazooAuth' и всегда в raw-форме (32 hex). Отсутствие
+    %% SPI-путь `handleKazooAuth' (какой claim выигрывает и почему их два —
+    %% в `account_id_claim/1', дефект R1) и всегда в raw-форме (32 hex). Отсутствие
     %% claim'а закрыл `a1eae36'; но пустой (`<<>>') либо малформный (не-32-
     %% байтный) `account_id' проходил `undefined'-гейт и падал badmatch'ем в
     %% `kzs_util:format_account_id/2' (`?MATCH_ACCOUNT_RAW = raw_account_id(_)'
@@ -557,9 +564,14 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
     %% формат — единственную форму, которую `format_account_id/2` не роняет и
     %% которую реально шлёт SPI. Всё прочее (`undefined'/`<<>>'/малформ) →
     %% чистый 401 `invalid_credentials' (образец `a1eae36').
-    RawAccountId = kz_maps:get(<<"account_id">>, UserInfoMap),
+    {RawAccountId, Claim} = account_id_claim(UserInfoMap),
     case is_raw_account_id(RawAccountId) of
         'true' ->
+            %% Дефект R1: ИЗ КАКОГО claim'а взят аккаунт — ключевая улика при
+            %% разборе «пользователь попал не в свой аккаунт». Само значение уже
+            %% печатает `claims_digest/1' выше, здесь логируем только источник.
+            lager:info("provide_keycloak_token[~p]: account_id from claim ~s",
+                       [Mode, Claim]),
             DbName = kzs_util:format_account_id(RawAccountId, 'encoded'),
             provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh,
                                    UserInfoMap, Mode, OwnerId, RawAccountId, DbName);
@@ -574,10 +586,47 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
             %%     503 вместо чистого 401. Реальный account_id из SPI-claim'а
             %%     всегда 32 hex; `is_raw_account_id/1' добавляет проверку
             %%     алфавита → не-hex отвергается здесь же, до БД.
+            %% `source' — из какого claim'а взято значение ПОСЛЕ фолбэка;
+            %% `source=default_account_id' значит в том числе, что ноты
+            %% `account_id' в userinfo не было вовсе.
             lager:info("provide_keycloak_token[~p]: userinfo account_id absent or"
-                       " malformed (~s) owner_id=~s (non-KazooAuth subject?) — rejecting",
-                       [Mode, zkeycloak_util:redact(RawAccountId), OwnerId]),
+                       " malformed (source=~s value=~s) owner_id=~s"
+                       " (non-KazooAuth subject?) — rejecting",
+                       [Mode, Claim, zkeycloak_util:redact(RawAccountId), OwnerId]),
             cb_context:add_system_error('invalid_credentials', Context)
+    end.
+
+%% @doc Значение Kazoo-`account_id' и ИМЯ claim'а, из которого оно взято.
+%%
+%% Дефект R1 (разбор 30.07, план `docs/superpowers/plans/2026-07-02-keycloak-26-upgrade.md'):
+%% в realm'е на ОДИН claim `account_id' претендовали ДВА маппера — hardcoded
+%% скоупа `onbill_scope' (константа; единственный источник для LDAP/Kerberos-
+%% субъектов, которым `handleKazooAuth' нот не пишет) и session-note клиента
+%% `onbill_client' (реальный аккаунт пользователя портала). В Keycloak порядок
+%% мапперов задаёт `ProtocolMapper.getPriority()', у обоих он 0 и меняется
+%% только КОДОМ провайдера, поэтому исход решает порядок обхода `HashSet' по
+%% `id.hashCode()' мапперов — он переворачивается молча при любой правке набора,
+%% а запись клейма идёт через `Map.put', т.е. побеждает последний. Фикс —
+%% развести claim'ы (hardcoded отдаёт `default_account_id') и задать приоритет
+%% ЗДЕСЬ, кодом: нота сильнее константы.
+%%
+%% Фолбэк срабатывает ТОЛЬКО когда ноты нет вовсе (`undefined' или JSON `null').
+%% Если нота есть, но малформна — фолбэка НЕТ: молча увести пользователя с битой
+%% нотой в ОБЩИЙ дефолтный аккаунт хуже, чем отдать чистый 401.
+%%
+%% NB: до правки realm'а (шаг 3.3 плана) `default_account_id' в токене не
+%% появляется вовсе, и функция ведёт себя ровно как прежний однострочный
+%% `kz_maps:get' — именно поэтому раскатывать её МОЖНО и НУЖНО до KC.
+-spec account_id_claim(map()) -> {any(), kz_term:ne_binary()}.
+account_id_claim(UserInfoMap) ->
+    case kz_maps:get(?ACCOUNT_ID_CLAIM, UserInfoMap) of
+        Absent when Absent =:= 'undefined';
+                    Absent =:= 'null' ->
+            {kz_maps:get(?DEFAULT_ACCOUNT_ID_CLAIM, UserInfoMap)
+            ,?DEFAULT_ACCOUNT_ID_CLAIM
+            };
+        AccountId ->
+            {AccountId, ?ACCOUNT_ID_CLAIM}
     end.
 
 %% @doc raw-account-id это ровно 32 hex-байта — единственная форма, которую

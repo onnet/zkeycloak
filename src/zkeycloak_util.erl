@@ -127,7 +127,13 @@
 %%                       штатный отказ «выключен маппер Add to userinfo →
 %%                       роли пусты → молча деним всех» (issue 13) без них
 %%                       не диагностируется в принципе;
-%%   `account_id'      — Kazoo-account из KazooAuth-claim'а (гейт issue 10).
+%%   `account_id'      — Kazoo-account из KazooAuth-claim'а (гейт issue 10);
+%%   `default_account_id' — тот же Kazoo-account, но из hardcoded-маппера
+%%                       скоупа (фолбэк для субъектов без нот, дефект R1).
+%%                       Значение той же природы, что `account_id' — id
+%%                       аккаунта, не ПДн; без него в логе исчезла бы
+%%                       диагностика LDAP-входов, где `account_id' не придёт
+%%                       вовсе, и «в какой аккаунт пустили» стало бы не видно.
 %% ПДн (`email', `preferred_username' (= логин, часто почта), `given_name',
 %% `family_name', `name', `phone_number', …) в список НЕ входят намеренно.
 -define(LOG_SAFE_CLAIMS, [<<"sub">>
@@ -146,6 +152,7 @@
                          ,<<"resource_access">>
                          ,<<"realm_access">>
                          ,<<"account_id">>
+                         ,<<"default_account_id">>
                          ]).
 
 %% @doc Ключи внутри ошибок валидации (`kzd_users:validate/3'), под которыми
