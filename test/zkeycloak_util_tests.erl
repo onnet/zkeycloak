@@ -284,7 +284,7 @@ claims_digest_empty_claims_test() ->
 %%% redact_validation_errors/1 (issue 15) — эхо ПДн в ошибках валидации
 %%%=============================================================================
 
-%% Форма `kzd_users:maybe_validate_username_is_unique/3': в `create_user/7'
+%% Форма `kzd_users:maybe_validate_username_is_unique/3': в `create_user/8'
 %% `username' = Email, поэтому коллизия печатала email целиком.
 username_unique_error() ->
     Msg = kz_json:from_list([{<<"message">>, <<"Username must be unique within account">>}
@@ -348,7 +348,7 @@ redact_crash_non_exit_passthrough_test() ->
 %%%=============================================================================
 
 redact_provisioning_error_masks_validation_errors_test() ->
-    %% `create_user/7' отдаёт Reason наверх СЫРЫМ, и
+    %% `create_user/8' отдаёт Reason наверх СЫРЫМ, и
     %% `cb_zkeycloak_ext:provide_keycloak_token/9' печатал его вторым `~p'
     %% на том же запросе — редакт в create_user без этого бесполезен.
     R = zkeycloak_util:redact_provisioning_error(username_unique_error()),
@@ -866,4 +866,177 @@ gate_setup() ->
 
 gate_cleanup(_) ->
     _ = (catch meck:unload('kz_datamgr')),
+    'ok'.
+
+%%%=============================================================================
+%%% `auth_source/2' — источник личности пользователя
+%%%
+%%% Четыре ветки и их ПОРЯДОК: `kerberos' → `ldap' → `kis' → `unknown'.
+%%% Порядок и есть предмет теста: Kerberos-субъект федерирован из того же AD,
+%%% и `ldap_uuid' у него тоже стоит; КИС-нота `account_name' появляется и у
+%%% LDAP-входа через форму `brt-unified'. Проверка «по одному маркеру за раз»
+%%% прошла бы и на неправильном порядке веток — поэтому в каждом тесте маркеры
+%%% КОНФЛИКТУЮТ, и утверждение звучит как «X сильнее Y».
+%%%
+%% Функция ЧИСТАЯ: вторым аргументом идёт уже посчитанный `auth_method/1',
+%% поэтому четыре ветки проверяются без мока крипто-границы. Связка
+%% «`auth_method' → `auth_source'» — ровно та, что собирает
+%% `cb_zkeycloak_ext:provide_keycloak_token/9' — покрыта отдельно
+%% (`auth_source_composition_test_'), уже с моком `kz_auth_jwt'.
+%%%=============================================================================
+
+-define(AS_LDAP_UUID, #{<<"ldap_uuid">> => <<"s-1-5-21-0001">>}).
+-define(AS_ACCOUNT_NAME, #{<<"account_name">> => <<"rast">>}).
+
+auth_source_test_() ->
+    [{"kerberos ПЕРВЫМ: сильнее ldap_uuid И account_name разом",
+      ?_assertEqual('kerberos', zkeycloak_util:auth_source(both_markers(), 'kerberos'))}
+    ,{"kerberos не смотрит на userinfo вовсе — даже на пустую мапу",
+      ?_assertEqual('kerberos', zkeycloak_util:auth_source(#{}, 'kerberos'))}
+    ,{"ldap: маркеров kerberos нет → ldap_uuid сильнее account_name",
+      ?_assertEqual('ldap', zkeycloak_util:auth_source(both_markers(), 'oidc'))}
+    ,{"ldap: пустой ldap_uuid — это всё равно федерированный субъект"
+      " (проверяем ПРИСУТСТВИЕ ключа, не годность значения)",
+      ?_assertEqual('ldap', zkeycloak_util:auth_source(#{<<"ldap_uuid">> => <<>>}, 'oidc'))}
+    ,{"kis: только нота account_name",
+      ?_assertEqual('kis', zkeycloak_util:auth_source(?AS_ACCOUNT_NAME, 'oidc'))}
+    ,{"unknown: ни одного маркера",
+      ?_assertEqual('unknown', zkeycloak_util:auth_source(#{<<"sub">> => <<"x">>}, 'oidc'))}
+    ,{"unknown: пустая userinfo",
+      ?_assertEqual('unknown', zkeycloak_util:auth_source(#{}, 'oidc'))}
+    ].
+
+%% Оба не-керберосных маркера сразу — так тест ловит именно ПОРЯДОК веток.
+both_markers() ->
+    maps:merge(?AS_LDAP_UUID, ?AS_ACCOUNT_NAME).
+
+%%%=============================================================================
+%%% Связка `auth_method/1' → `auth_source/2' — как её собирает
+%%% `cb_zkeycloak_ext:provide_keycloak_token/9'
+%%%
+%%% Смысл: определение «керберос» в приложении ОДНО, и живёт оно в
+%%% `auth_method/1' — вместе с маркером `amr' (in-flow SPNEGO), которого нет
+%%% в `acr'. SPNEGO-субъект федерирован из того же AD, `ldap_uuid' у него
+%%% стоит, и без этой связки он получил бы `auth_method=kerberos' и
+%%% `auth_source=ldap' в ОДНОМ токене.
+%%%
+%%% `kz_auth_jwt' — граница (проверка подписи), её мокаем: собирать живой
+%%% подписанный JWT ради двух claim'ов незачем.
+%%%=============================================================================
+
+-define(AS_TOKEN, <<"access-token-stub">>).
+
+auth_source_composition_test_() ->
+    {'setup', fun auth_source_setup/0, fun auth_source_cleanup/1,
+     fun(_) ->
+             [{"acr=kerberos + ldap_uuid → kerberos",
+               fun() ->
+                       mock_claims([{<<"acr">>, <<"kerberos">>}]),
+                       ?assertEqual('kerberos', auth_source_of_token(both_markers()))
+               end}
+             ,{"amr=[spnego] БЕЗ acr=kerberos + ldap_uuid → тоже kerberos:"
+               " маркер amr виден только через auth_method/1",
+               fun() ->
+                       mock_claims([{<<"acr">>, <<"1">>}
+                                   ,{<<"amr">>, [<<"spnego">>]}
+                                   ]),
+                       ?assertEqual('kerberos', auth_source_of_token(both_markers()))
+               end}
+             ,{"обычный OIDC-вход (маркеров нет) + ldap_uuid → ldap",
+               fun() ->
+                       mock_claims([{<<"acr">>, <<"1">>}]),
+                       ?assertEqual('ldap', auth_source_of_token(both_markers()))
+               end}
+             ,{"битый/непроверяемый access-токен не роняет связку: auth_method/1"
+               " отдаёт oidc, решает состав userinfo",
+               fun() ->
+                       meck:expect('kz_auth_jwt', 'decode',
+                                   fun(_T, _V) -> {'error', 'verify_failed'} end),
+                       ?assertEqual('kis', auth_source_of_token(?AS_ACCOUNT_NAME)),
+                       ?assertEqual('unknown', auth_source_of_token(#{}))
+               end}
+             ]
+     end}.
+
+%% Ровно та композиция, что стоит в `provide_keycloak_token/9'.
+auth_source_of_token(UserInfoMap) ->
+    zkeycloak_util:auth_source(UserInfoMap, zkeycloak_util:auth_method(?AS_TOKEN)).
+
+mock_claims(Claims) ->
+    meck:expect('kz_auth_jwt', 'decode', fun(_T, _V) -> {'ok', [], Claims} end).
+
+auth_source_setup() ->
+    meck:new('kz_auth_jwt', ['no_link']),
+    'ok'.
+
+auth_source_cleanup(_) ->
+    _ = (catch meck:unload('kz_auth_jwt')),
+    'ok'.
+
+%%%=============================================================================
+%%% `auth_origin' в user-doc'е при автосоздании (`create_user/8')
+%%%
+%%% Проверяем ровно точку записи: что уходит в `kzd_users:validate/3'.
+%%% Дальше по коду — `crossbar_doc'/`kz_datamgr', их не трогаем: мок валидации
+%%% отдаёт `validation_errors' и обрывает путь до датастора.
+%%% `passthrough' нужен из-за `?MK_USER' — он зовёт `kzd_users:type/0'.
+%%%=============================================================================
+
+-define(CU_ACCOUNT_ID, <<"0123456789abcdef0123456789abcdef">>).
+-define(CU_OWNER_ID, <<"fedcba9876543210fedcba9876543210">>).
+
+create_user_auth_origin_test_() ->
+    {'setup', fun create_user_setup/0, fun create_user_cleanup/1,
+     fun(_) ->
+             [{"create_user/8 кладёт auth_origin в user-doc",
+               fun() ->
+                       _ = create_user([<<"ldap">>]),
+                       ?assertEqual(<<"ldap">>, captured(<<"auth_origin">>))
+               end}
+             ,{"unknown пишется значением, а не пропуском поля: отличает"
+               " «новый код, источник не определён» от дока до этой правки",
+               fun() ->
+                       _ = create_user([<<"unknown">>]),
+                       ?assertEqual(<<"unknown">>, captured(<<"auth_origin">>))
+               end}
+             ,{"create_user/7 (старая арность, прод-beam во время хотлоада)"
+               " поля не добавляет — старые доки остаются валидными",
+               fun() ->
+                       _ = create_user([]),
+                       ?assertEqual('undefined', captured(<<"auth_origin">>))
+               end}
+             ,{"остальные поля дока не поехали от новой арности",
+               fun() ->
+                       _ = create_user([<<"kis">>]),
+                       ?assertEqual(<<"ivan@example.com">>, captured(<<"username">>)),
+                       ?assertEqual(<<"Ivan">>, captured(<<"first_name">>)),
+                       ?assertEqual(<<"Petrov">>, captured(<<"last_name">>)),
+                       ?assertEqual(<<"admin">>, captured(<<"priv_level">>))
+               end}
+             ]
+     end}.
+
+%% `Extra' — либо `[]' (вызов старой арности), либо `[AuthOrigin]'.
+create_user(Extra) ->
+    apply('zkeycloak_util', 'create_user'
+         ,[?CU_ACCOUNT_ID, ?CU_OWNER_ID, <<"Ivan">>, <<"Petrov">>
+          ,<<"ivan@example.com">>, 'undefined', <<"pwd-stub">>
+          ] ++ Extra).
+
+%% Последний `UDoc', доехавший до валидации. В истории есть и `type/0'
+%% (его зовёт `?MK_USER'), поэтому отбираем именно клаузы `validate/3'.
+captured(Key) ->
+    UDocs = [UDoc
+             || {_Pid, {'kzd_users', 'validate', [_AccountId, _Id, UDoc]}, _Res}
+                    <- meck:history('kzd_users')
+            ],
+    kz_json:get_value(Key, lists:last(UDocs)).
+
+create_user_setup() ->
+    meck:new('kzd_users', ['no_link', 'passthrough']),
+    meck:expect('kzd_users', 'validate', fun(_A, _I, _UDoc) -> {'validation_errors', []} end),
+    'ok'.
+
+create_user_cleanup(_) ->
+    _ = (catch meck:unload('kzd_users')),
     'ok'.

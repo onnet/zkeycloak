@@ -18,6 +18,7 @@
         ,introspect_token/1
         ,refresh_token/1
         ,create_user/7
+        ,create_user/8
         ,jwt_claims/1
         ,jwt_iss/1
         ,maybe_keycloak_token/1
@@ -28,6 +29,7 @@
         ,kerberos_auth_url/0
         ,kerberos_auth_url/1
         ,auth_method/1
+        ,auth_source/2
         ,logout_url/0
         ,logout_url/1
         ,redact/1
@@ -63,6 +65,16 @@
 
 -include_lib("kazoo_stdlib/include/kz_types.hrl").
 
+%% Источник личности пользователя — см. `auth_source/2'. Тип экспортируется,
+%% потому что его носит межмодульный контракт: `cb_zkeycloak_ext' протаскивает
+%% атом от `provide_keycloak_token' через `check_user_doc'/`ensure_user_doc'
+%% до `issue_auth_token' (в `create_user/8' и в claim он уходит уже бинарём,
+%% через `kz_term:to_binary/1'). Перечисление должно жить в ОДНОМ месте —
+%% иначе новая ветка в `auth_source/2' молча разъедется со спеками
+%% вызывающего.
+-type auth_source() :: 'ldap' | 'kerberos' | 'kis' | 'unknown'.
+-export_type([auth_source/0]).
+
 %% @doc HTTP-заголовки, ЗНАЧЕНИЯ которых нельзя писать в лог сырыми: несут
 %% живой Bearer-токен (`authorization'), Kazoo auth-token (`x-auth-token'),
 %% session-cookie или proxy-креды. Имена сравниваем в нижнем регистре
@@ -86,7 +98,7 @@
 %%   `id_token_hint'  — сырой id_token (logout-флоу, `logout_url/1');
 %%   `code'/`code_verifier' — обменный материал (одноразовый, но до обмена
 %%                      валидный; тот же класс, что закрыл issue 01);
-%%   `password'       — `create_user/7' Props + форма `brt-unified' flow;
+%%   `password'       — `create_user/8' Props + форма `brt-unified' flow;
 %%   `client_secret'  — кред клиента `onbill_client' (config-ключ);
 %%   `access_token'/`id_token'/`auth_token' — канонические имена ровно того
 %%                      материала, которым оперирует модуль (`x-auth-token'
@@ -165,7 +177,7 @@
 %% @doc Ключи внутри ошибок валидации (`kzd_users:validate/3'), под которыми
 %% лежит ЭХО отвергнутого значения, т.е. ПДн из claim'ов KC. Живой путь:
 %% `kzd_users:maybe_validate_username_is_unique/3' кладёт `{<<"cause">>,
-%% Username}', а `create_user/7' подставляет в `username' именно `Email' —
+%% Username}', а `create_user/8' подставляет в `username' именно `Email' —
 %% т.е. коллизия username'а печатала email целиком. Схемные отказы
 %% (`kz_json_schema:error_to_jobj/2') кладут отвергнутое значение в
 %% `value'/`cause' — то же самое для `first_name'/`last_name'/`email'.
@@ -990,7 +1002,7 @@ redact_token_result(Other) ->
     kz_term:to_binary(io_lib:format("~p", [Other])).
 
 %% @doc Санитайзер причины отказа в провижининге user-doc'а для лога.
-%% `create_user/7' редактирует СВОЮ лог-строку, но наверх отдаёт `Reason'
+%% `create_user/8' редактирует СВОЮ лог-строку, но наверх отдаёт `Reason'
 %% сырым (клиенту нужен полный per-field error) — и вызывающий
 %% `cb_zkeycloak_ext:provide_keycloak_token/9' печатал его вторым `~p' на
 %% том же самом запросе, обнуляя редакт (`reason=~p'). Диспетчер сводит обе
@@ -1156,7 +1168,7 @@ redact_reason_value(_Value) ->
     '$redacted'.
 
 %% @doc Присутствует ли поле — для presence-логов вместо значений-ПДн
-%% (`create_user/7', issue 15). `undefined'/пусто = отсутствует.
+%% (`create_user/8', issue 15). `undefined'/пусто = отсутствует.
 -spec is_present(any()) -> boolean().
 is_present('undefined') -> 'false';
 is_present(<<>>) -> 'false';
@@ -1189,8 +1201,34 @@ redact_user_doc_result(Other) ->
                               | term()}
                     | kz_datamgr:data_error().
 create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPassword) ->
+    %% Обратная совместимость: `auth_origin' — новое ОПЦИОНАЛЬНОЕ поле, и
+    %% `undefined' здесь значит ровно «источник не сообщён» — `filter_empty'
+    %% ниже выкидывает ключ, документ получается байт-в-байт прежним.
+    %% Клауза сохранена не «на всякий случай»: `create_user/7' — публичный
+    %% экспорт приложения, и во время хотлоада прод-`cb_zkeycloak_ext.beam'
+    %% (ещё старый) зовёт именно её. Снеси мы арность — окно между загрузкой
+    %% `zkeycloak_util' и `cb_zkeycloak_ext' роняло бы КАЖДЫЙ первый вход
+    %% в `undef'.
+    create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber
+               ,UserPassword, 'undefined').
+
+-spec create_user(kz_term:ne_binary()
+                 ,kz_term:ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ,kz_term:api_binary()
+                 ,kz_term:ne_binary()
+                 ,kz_term:api_ne_binary()
+                 ) -> {'ok', kz_json:object()}
+                    | {'error', {'validation_errors', kazoo_documents:doc_validation_errors()}
+                              | {'system_error', atom()}
+                              | term()}
+                    | kz_datamgr:data_error().
+create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPassword
+           ,AuthOrigin) ->
     %% issue 15: `Email'/`Firstname'/`Surname'/`Phonenumber' — ПДн, приехавшие
-    %% из userinfo KC (`cb_zkeycloak_ext:ensure_user_doc/4' достаёт их из
+    %% из userinfo KC (`cb_zkeycloak_ext:ensure_user_doc/5' достаёт их из
     %% claim'ов), и сырой `~p' клал их в plaintext-лог на первом логине
     %% КАЖДОГО пользователя. Логируем НАЛИЧИЕ полей вместо значений —
     %% диагностическая ценность сохраняется полностью: штатный сбой здесь это
@@ -1203,6 +1241,14 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
     lager:info("create_user has_firstname: ~p",[is_present(Firstname)]),
     lager:info("create_user has_surname: ~p",[is_present(Surname)]),
     lager:info("create_user has_phonenumber: ~p",[is_present(Phonenumber)]),
+    lager:info("create_user auth_origin: ~p",[AuthOrigin]),
+    %% `auth_origin' — источник личности на момент АВТОСОЗДАНИЯ дока
+    %% (`auth_source/2' вызывающего). Не ПДн: это `ldap'/`kerberos'/`kis'/
+    %% `unknown', поэтому логируется значением, а не presence-флагом.
+    %% `filter_empty' выкидывает `undefined' — старый путь (`create_user/7')
+    %% и старые доки без поля остаются валидными; схема `users' верхнеуровневый
+    %% `additionalProperties' не задаёт, поэтому лишний ключ валидацию
+    %% `kzd_users:validate/3' не роняет.
     Props = props:filter_empty([{<<"username">>, Email}
                                ,{<<"first_name">>, Firstname}
                                ,{<<"last_name">>, Surname}
@@ -1210,6 +1256,7 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
                                ,{<<"contact_phonenumber">>, Phonenumber}
                                ,{<<"password">>, UserPassword}
                                ,{<<"priv_level">>, <<"admin">>}
+                               ,{<<"auth_origin">>, AuthOrigin}
                                ]),
     DbName = kzs_util:format_account_db(AccountId),
     Ctx0 = cb_context:set_account_id(cb_context:new(), AccountId),
@@ -1505,6 +1552,57 @@ auth_method(Token) ->
         {<<"kerberos">>, _} -> 'kerberos';
         {_, 'true'} -> 'kerberos';
         _ -> 'oidc'
+    end.
+
+%% @doc Откуда приехала личность пользователя — в отличие от `auth_method/1',
+%% который отвечает только «Kerberos или нет».
+%%
+%% Зачем отдельная функция: `provide_keycloak_token' отбрасывает `ldap_uuid'
+%% (он есть только у федерированных из AD субъектов), и на последующих
+%% запросах handler'ы видят LDAP-юзера и КИС-юзера одинаково — `auth_method
+%% = oidc' у обоих. `auth_source/2' — ДОБАВЛЯЕМЫЙ read-only признак; на
+%% решения самой аутентификации он не влияет и `auth_method' не заменяет.
+%%
+%% Порядок веток принципиален — `kerberos' проверяется ПЕРВЫМ. Kerberos-юзер
+%% федерирован из того же AD и `ldap_uuid' у него тоже есть; без приоритета
+%% он схлопнулся бы в `ldap', то есть более точный признак терялся бы под
+%% менее точным. По той же причине `ldap' сильнее `kis': `account_name' в
+%% userinfo ставит форма `brt-unified' (User Session Note) и у LDAP-входа с
+%% пустым/`rast' полем аккаунта она тоже присутствует.
+%%
+%% Вторым аргументом идёт УЖЕ ПОСЧИТАННЫЙ `auth_method/1', а не сырой
+%% access-токен (постановка в `open-work.md' предлагала токен). Причина не
+%% стилистическая:
+%%   * `auth_method/1' — единственное определение «керберос» в приложении: он
+%%     знает ОБА маркера KC, `acr=kerberos' (broker IdP flow) и `amr' с
+%%     `kerb'/`kerberos'/`spnego' (in-flow SPNEGO-аутентификатор). Принимая
+%%     его РЕЗУЛЬТАТ, `auth_source/2' не может с ним разъехаться в принципе —
+%%     тогда как своя проверка `acr' дала бы SPNEGO-вход с `auth_method=
+%%     kerberos' и одновременно `auth_source=ldap' в одном токене;
+%%   * разбор токена — это ПРОВЕРКА ПОДПИСИ (`kz_auth_jwt:decode/2' с
+%%     `Verify=true'). Возьми функция токен — на каждом логине и refresh'е
+%%     подпись верифицировалась бы дважды: здесь и в `issue_auth_token', где
+%%     `auth_method' нужен для своего claim'а. Вызывающий считает `auth_method'
+%%     один раз и передаёт обоим потребителям; лишней криптографии на горячем
+%%     auth-пути правка не добавляет вовсе.
+%% Побочный эффект — функция ЧИСТАЯ: её четыре ветки тестируются без мока
+%% крипто-границы.
+-spec auth_source(map(), 'oidc' | 'kerberos') -> auth_source().
+auth_source(_UserInfoMap, 'kerberos') -> 'kerberos';
+auth_source(UserInfoMap, 'oidc') -> userinfo_auth_source(UserInfoMap).
+
+%% @doc Не-Kerberos источник по составу userinfo: `ldap_uuid' ставит
+%% user-federation-маппер AD, `account_name' — нота КИС-формы. Проверяем
+%% ПРИСУТСТВИЕ ключа, а не годность значения: пустой `ldap_uuid' — это всё
+%% равно федерированный субъект, и подменять его на `kis' нельзя.
+-spec userinfo_auth_source(map()) -> 'ldap' | 'kis' | 'unknown'.
+userinfo_auth_source(UserInfoMap) ->
+    HasLdapUuid = maps:is_key(<<"ldap_uuid">>, UserInfoMap),
+    HasAccountName = maps:is_key(<<"account_name">>, UserInfoMap),
+    case {HasLdapUuid, HasAccountName} of
+        {'true', _} -> 'ldap';
+        {_, 'true'} -> 'kis';
+        _ -> 'unknown'
     end.
 
 -spec logout_url() -> kz_term:ne_binary().

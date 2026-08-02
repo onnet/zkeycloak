@@ -651,17 +651,24 @@ is_raw_account_id(AccountId) ->
                             ) -> cb_context:context().
 provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                        Mode, OwnerId, AccountId, DbName) ->
-    case check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap) of
+    %% Токен разбираем РОВНО ОДИН раз на запрос: `auth_method/1' верифицирует
+    %% подпись access-токена, и оба потребителя ниже — user-doc при
+    %% автосоздании и claim'ы Kazoo-JWT — получают уже посчитанные значения.
+    %% До этой правки декодирование было одно (в `issue_auth_token'); столько
+    %% же осталось и после.
+    AuthMethod = zkeycloak_util:auth_method(TokenAccess),
+    AuthSource = zkeycloak_util:auth_source(UserInfoMap, AuthMethod),
+    case check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap, AuthSource) of
         'ok' ->
-            issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
-                             AccountId, OwnerId);
+            issue_auth_token(Context, TokenId, TokenRefresh, UserInfoMap,
+                             AccountId, OwnerId, AuthMethod, AuthSource);
         {'error', Reason} ->
-            %% issue 15 (review-loop): `Reason' приезжает из `create_user/7'
+            %% issue 15 (review-loop): `Reason' приезжает из `create_user/8'
             %% СЫРЫМ — там редактируется только собственная лог-строка, а
             %% наверх терм уходит как есть (его ждёт `reject_user_provisioning/3'
             %% → `add_doc_validation_errors/2', клиенту нужен полный per-field
             %% error). Без редакта здесь тот же email/UDoc печатался вторым
-            %% `~p' на том же запросе, обнуляя фикс в `create_user/7'.
+            %% `~p' на том же запросе, обнуляя фикс в `create_user/8'.
             %% Редактируем ЛОГ-копию; в `reject_user_provisioning/3' по-прежнему
             %% уходит сырой `Reason' — поведение не меняется.
             lager:warning("provide_keycloak_token[~p]: user doc check failed"
@@ -684,18 +691,39 @@ provide_keycloak_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
 %% whitelist: сервисные учётки локальные, через Keycloak не ходят.
 %% На login-ветке гейт ПОСЛЕ `ensure_user_doc' — JIT-созданный док
 %% enabled по умолчанию, поведение первого входа не меняется.
+-ifdef(TEST).
+%% Входная точка EUnit (`cb_zkeycloak_ext_tests') — у теста access-токена нет,
+%% и источник ему не интересен: он меряет enabled-гейт. Под `-ifdef(TEST)'
+%% клауза стоит не для красоты: в прод-сборке её никто не зовёт, и `-Werror'
+%% на `+warn_unused_vars' валит сборку на «function check_user_doc/5 is
+%% unused». `'unknown'' здесь — не «поле не писать», а честное «источник не
+%% определён»: в док оно так и попадёт.
 -spec check_user_doc('login' | 'refresh'
                     ,kz_term:ne_binary()
                     ,kz_term:ne_binary()
                     ,kz_term:ne_binary()
                     ,map()
                     ) -> 'ok' | {'error', term()}.
-check_user_doc('login', DbName, AccountId, OwnerId, UserInfoMap) ->
-    case ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) of
+check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap) ->
+    check_user_doc(Mode, DbName, AccountId, OwnerId, UserInfoMap, 'unknown').
+-endif.
+
+-spec check_user_doc('login' | 'refresh'
+                    ,kz_term:ne_binary()
+                    ,kz_term:ne_binary()
+                    ,kz_term:ne_binary()
+                    ,map()
+                    ,zkeycloak_util:auth_source()
+                    ) -> 'ok' | {'error', term()}.
+check_user_doc('login', DbName, AccountId, OwnerId, UserInfoMap, AuthSource) ->
+    case ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap, AuthSource) of
         'ok' -> check_user_enabled(DbName, OwnerId);
         {'error', _} = Err -> Err
     end;
-check_user_doc('refresh', DbName, _AccountId, OwnerId, _UserInfoMap) ->
+check_user_doc('refresh', DbName, _AccountId, OwnerId, _UserInfoMap, _AuthSource) ->
+    %% Refresh-путь доков не создаёт: `auth_origin' проставляется один раз,
+    %% при автосоздании, и переписывать его на каждом refresh нельзя —
+    %% это стёрло бы источник ПЕРВИЧНОГО входа.
     case kz_datamgr:open_doc(DbName, OwnerId) of
         {'ok', UserDoc} -> user_enabled_gate(UserDoc);
         Err -> {'error', {'missing_user_doc_on_refresh', Err}}
@@ -734,8 +762,9 @@ user_enabled_gate(UserDoc) ->
                      ,kz_term:ne_binary()
                      ,kz_term:ne_binary()
                      ,map()
+                     ,zkeycloak_util:auth_source()
                      ) -> 'ok' | {'error', term()}.
-ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) ->
+ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap, AuthSource) ->
     case kz_datamgr:open_doc(DbName, OwnerId) of
         {'ok', _} -> 'ok';
         {'error', 'not_found'} ->
@@ -743,8 +772,12 @@ ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap) ->
             Surname = kz_maps:get(<<"family_name">>, UserInfoMap, 'undefined'),
             Email = kz_maps:get(<<"email">>, UserInfoMap, 'undefined'),
             UserPassword = kz_binary:rand_hex(12),
+            %% `auth_origin' фиксируется только здесь — на JIT-создании дока.
+            %% Существующий док (ветка `{ok,_}') не трогаем: поле описывает
+            %% ПЕРВЫЙ вход, а не последний.
             case zkeycloak_util:create_user(AccountId, OwnerId, Firstname, Surname,
-                                            Email, 'undefined', UserPassword) of
+                                            Email, 'undefined', UserPassword,
+                                            kz_term:to_binary(AuthSource)) of
                 {'ok', _} -> 'ok';
                 {'error', _} = Err -> Err
             end;
@@ -794,16 +827,21 @@ reject_user_provisioning(Context, 'login', _Reason) ->
     cb_context:add_system_error('unspecified_fault', Context).
 
 %% @doc Выпуск Kazoo auth-token'а + обогащение KC-токенами.
+%% `TokenAccess' в аргументах больше НЕТ: он был нужен только ради
+%% `auth_method/1', а тот теперь считается один раз в `provide_keycloak_token/9'
+%% и приезжает сюда готовым. Значение в auth-doc'е от этого не меняется —
+%% тот же атом, та же `kz_term:to_binary/1'.
 -spec issue_auth_token(cb_context:context()
-                      ,kz_term:ne_binary()
                       ,kz_term:ne_binary()
                       ,kz_term:ne_binary()
                       ,map()
                       ,kz_term:ne_binary()
                       ,kz_term:ne_binary()
+                      ,'oidc' | 'kerberos'
+                      ,zkeycloak_util:auth_source()
                       ) -> cb_context:context().
-issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
-                 AccountId, OwnerId) ->
+issue_auth_token(Context, TokenId, TokenRefresh, UserInfoMap,
+                 AccountId, OwnerId, AuthMethodAtom, AuthSource) ->
     UserInfoJObj = kz_json:from_map(UserInfoMap),
     %% issue 15: `UserInfoJObj' — те же claim'ы, что и выше, только в
     %% JObj-форме; сырой `~p' дублировал утечку ПДн. Логируем выжимку из
@@ -811,7 +849,7 @@ issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
     %% сохранён, хотя содержательно эта строка дублирует `authorize_and_issue'.
     lager:info("provide_keycloak_token/5  UserInfoJObj: ~p"
               ,[zkeycloak_util:claims_digest(UserInfoMap)]),
-    AuthMethod = kz_term:to_binary(zkeycloak_util:auth_method(TokenAccess)),
+    AuthMethod = kz_term:to_binary(AuthMethodAtom),
     AccountName = kz_maps:get(<<"account_name">>, UserInfoMap, 'undefined'),
     JObj = kz_json:from_list(
              props:filter_undefined(
@@ -821,6 +859,13 @@ issue_auth_token(Context, TokenAccess, TokenId, TokenRefresh, UserInfoMap,
                ,{<<"kc_full_name">>, build_full_name(UserInfoJObj)}
                ,{<<"auth_method">>, AuthMethod}
                ,{<<"account_name">>, AccountName}
+                %% `auth_source' ДОПОЛНЯЕТ `auth_method', а не заменяет его:
+                %% `auth_method' остаётся прежним двузначным (`oidc'/`kerberos')
+                %% — фронт гейтит по нему logout-ветку, и его словарь трогать
+                %% нельзя. Consumer'ы, не знающие поля, ведут себя как раньше;
+                %% токены, выпущенные до этой правки, поля не имеют вовсе —
+                %% для них `auth_source' = `undefined', фолбэк на `auth_method'.
+               ,{<<"auth_source">>, kz_term:to_binary(AuthSource)}
                ])),
     Ctx1 = crossbar_auth:create_auth_token(cb_context:set_doc(Context, JObj),
                                            'cb_zkeycloak_ext'),
