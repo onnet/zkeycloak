@@ -987,7 +987,7 @@ redact_token_result({'ok', {'oidcc_token'
      ," access=", (redact(Access))/binary
      ," refresh=", (redact(Refresh))/binary, "}">>;
 redact_token_result({'ok', _Unrecognized}) ->
-    <<"{ok,<unrecognized oidcc_token shape — redacted>}">>;
+    <<"{ok,<unrecognized oidcc_token shape — redacted>}"/utf8>>;
 redact_token_result({'error', Reason}) ->
     %% P1 (кросс-ревью 18.07 волна 2): `refresh_token/1' логирует ВЕСЬ Result
     %% через этот хелпер (line 497) ДО case-разбора, а на refresh-пути oidcc
