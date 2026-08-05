@@ -218,7 +218,7 @@ init_pins_execute_bindings_test() ->
 
 -spec preset_fatal(cb_context:context()) -> cb_context:context().
 preset_fatal(Context) ->
-    %% контекст, каким его отдаёт api_util:execute_request_folds/4 до фолда
+    %% контекст, каким его отдаёт api_util:execute_request/5 до фолда
     cb_context:setters(Context
                       ,[{fun cb_context:set_resp_status/2, 'fatal'}
                        ,{fun cb_context:set_resp_error_msg/2, <<"request execution failed">>}
