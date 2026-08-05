@@ -6,9 +6,7 @@
         ,authorize/1, authorize/2
         ,authenticate/1, authenticate/2
         ,validate/1,validate/2
-        ]).
-
--export([zkeycloak_ext_post/1
+        ,post/1, post/2
         ]).
 
 -include("/opt/kazoo/applications/crossbar/src/crossbar.hrl").
@@ -51,6 +49,13 @@
 -define(PROVIDER_UNAVAILABLE_ERROR, 'oidc_provider_unavailable').
 -define(PROVIDER_UNAVAILABLE_MSG, <<"identity provider is not available, retry later">>).
 
+%% Ключ хэнд-овера validate -> post (execute-фаза, issue 22). Мутирующий
+%% POST-путь в модуле РОВНО ОДИН — `?REFRESH': обмен refresh-токена в KC
+%% (провайдер РОТИРУЕТ токен, т.е. вызов необратим) плюс выпуск Kazoo-токена.
+%% Значение тегировано путём; отсутствие тега = разрыв хэнд-овера (окно
+%% hotload-скью) ⇒ повторного обмена уже потраченным токеном не будет.
+-define(POST_HANDOVER, 'zkeycloak_ext_post_refresh').
+
 -spec init() -> ok.
 init() ->
     _ = crossbar_bindings:bind(<<"*.authenticate.zkeycloak_ext">>, ?MODULE, 'authenticate'),
@@ -58,7 +63,7 @@ init() ->
     _ = crossbar_bindings:bind(<<"*.allowed_methods.zkeycloak_ext">>, ?MODULE, 'allowed_methods'),
     _ = crossbar_bindings:bind(<<"*.resource_exists.zkeycloak_ext">>, ?MODULE, 'resource_exists'),
     _ = crossbar_bindings:bind(<<"*.validate.zkeycloak_ext">>, ?MODULE, 'validate'),
-    %%    _ = crossbar_bindings:bind(<<"*.execute.put.ext">>, ?MODULE, 'put'),
+    _ = crossbar_bindings:bind(<<"*.execute.post.zkeycloak_ext">>, ?MODULE, 'post'),
     ok.
 
 -spec allowed_methods() -> http_methods().
@@ -325,7 +330,12 @@ validate(Context, ?REFRESH) ->
             lager:info("validate_ext/2 refresh: missing refresh_token in body"),
             cb_context:add_system_error('invalid_credentials', Context);
         _ ->
-            handle_refresh(Context, RefreshToken)
+            %% сам обмен уехал в post/2 (issue 22): validate только проверяет,
+            %% что токен вообще прислан, — отказ 401 остаётся ДО обращения к KC
+            cb_context:set_resp_status(
+              cb_context:store(Context, ?POST_HANDOVER, {?REFRESH, RefreshToken})
+             ,'success'
+             )
     end;
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
@@ -335,9 +345,64 @@ validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
     zkeycloak_ext_post(Context).
 
+%%------------------------------------------------------------------------------
+%% @doc execute-фаза (issue 22). Мутирующий verb у модуля один — POST, но
+%% эффект есть ровно у ОДНОГО из его путей.
+%%
+%% `?REFRESH' — эффект: обмен refresh-токена в Keycloak НЕОБРАТИМ (KC ротирует
+%% токен, повторный обмен тем же значением даёт `invalid_grant') и завершается
+%% выпуском Kazoo-auth-токена, то есть записью auth-дока. Раньше вся цепочка
+%% шла из validate: без execute-подписчиков вендорный пресет fatal/500 отвечал
+%% бы 500 клиенту, у которого refresh-токен УЖЕ потрачен, а новый он не увидел —
+%% mobile-клиент уходил бы в полный AppAuth-flow на ровном месте.
+%%
+%% `/', `?ZKEYCLOAK', `?LOGOUT' — мутации нет вовсе: первые два только логируют,
+%% третий СОБИРАЕТ url разлогина и кладёт его в resp_data. Конверт этих путей
+%% готовит validate, и это не «эффект, оставленный в validate»: у `?LOGOUT' жив
+%% legacy-GET (переходный период), а у GET execute-фазы нет вообще — перенос
+%% сборки ответа в коллбэк оставил бы GET-ветку без него. Коллбэк здесь только
+%% восстанавливает success поверх fatal/500-пресета фолда.
+%% @end
+%%------------------------------------------------------------------------------
+-spec post(cb_context:context()) -> cb_context:context().
+post(Context) ->
+    post_reply(Context).
+
+-spec post(cb_context:context(), path_token()) -> cb_context:context().
+post(Context, ?REFRESH) ->
+    execute_refresh(Context, cb_context:fetch(Context, ?POST_HANDOVER));
+post(Context, ?LOGOUT) ->
+    post_reply(Context);
+post(Context, ?ZKEYCLOAK) ->
+    post_reply(Context);
+post(Context, _Path) ->
+    %% сюда не доводит allowed_methods (остальные пути GET-only), но коллбэк
+    %% обязан быть тотальным: function_clause в фолде = 500 с обнулённым
+    %% resp_data вместо честного ответа
+    lager:info("execute post for non-mutating path ~s, nothing to apply", [_Path]),
+    Context.
+
 %%%=============================================================================
 %%% Internal functions
 %%%=============================================================================
+
+%% Конверт, собранный validate'ом (у не-мутирующих путей он и есть ответ),
+%% поверх вендорного fatal/500-пресета фолда.
+-spec post_reply(cb_context:context()) -> cb_context:context().
+post_reply(Context) ->
+    cb_context:set_resp_status(Context, 'success').
+
+%% Разрыв хэнд-овера (окно hotload-скью: validate прошёл на СТАРОМ биме и обмен
+%% там уже сделал) — второго обмена НЕ делаем: refresh-токен запроса к этому
+%% моменту уже ротирован KC, и повторный вызов вернул бы `invalid_grant',
+%% выбросив клиента в полный AppAuth-flow. Клиент получает fatal/500-пресет и
+%% ретраит после раскатки.
+-spec execute_refresh(cb_context:context(), any()) -> cb_context:context().
+execute_refresh(Context, {?REFRESH, RefreshToken}) ->
+    handle_refresh(Context, RefreshToken);
+execute_refresh(Context, _NoHandover) ->
+    lager:info("execute post refresh without validate handover, refusing to exchange token"),
+    Context.
 
 %%------------------------------------------------------------------------------
 %% @doc Ответ ручек, отдающих /authorize-URL (`auth_link', `kerberos_login').
