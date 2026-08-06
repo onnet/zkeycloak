@@ -2,14 +2,18 @@
 
 Приложение `zkeycloak` (`applications/zkeycloak/`) обеспечивает интеграцию Kazoo с Keycloak через OIDC.
 
-**Keycloak SPI** (`keycloak-brt-authenticator/`) — Java-расширение для Keycloak 23.0.3, реализующее единую точку входа.
+**Keycloak SPI** — Java-расширение, реализующее единую точку входа. Дерево SPI лежит **вне**
+`kazoo_5027`: `/home/iam/Development/keycloak-brt-authenticator/`. Целевая версия Keycloak —
+**26.6.4** (`pom.xml`, `<keycloak.version>`); миграция 23 → 26.6.4 закрыта.
 
 ## Маппинг идентификаторов (KIS owner_id ↔ Keycloak sub)
 
 - При создании КИС-пользователя в Keycloak, его UUID = KIS `owner_id` (в формате с дефисами)
 - `addUser(realm, toUuidFormat(ownerId), username, false, false)` — ownerId без дефисов конвертируется в UUID
 - `sub` claim в OIDC-токене = owner_id в UUID-формате
-- Callback: `zbrt_util:from_key(sub)` возвращает оригинальный KIS owner_id (убирает дефисы)
+- Callback: `zcore_util:from_key(sub)` возвращает оригинальный KIS owner_id (убирает дефисы).
+  ⚠️ Функция переехала в zcore по правилу «переиспользование только через zcore»; `zbrt_util`
+  в `zkeycloak/src` не вызывается ни разу
 - Пользователь уже существует в КИС, повторное создание не требуется
 - SPI автоматически назначает клиентскую роль `onbill_access` (на `onbill_client`)
 
@@ -31,9 +35,9 @@
 
 ## Callback (`cb_zkeycloak_ext.erl`)
 
-- `provide_keycloak_token/3` — обмен OIDC code → Kazoo auth token
+- `provide_keycloak_token/6,/7,/9` — обмен OIDC code → Kazoo auth token (арности /3 нет)
 - Проверяет наличие роли `onbill_access` в `resource_access.onbill_client.roles` (default `[]`)
-- `OwnerId = zbrt_util:from_key(sub)` — извлекает KIS owner_id из Keycloak sub claim
+- `OwnerId = zcore_util:from_key(sub)` — извлекает KIS owner_id из Keycloak sub claim
 
 ## Деплой
 
