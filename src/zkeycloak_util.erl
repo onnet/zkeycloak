@@ -1255,7 +1255,16 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
                                ,{<<"email">>, Email}
                                ,{<<"contact_phonenumber">>, Phonenumber}
                                ,{<<"password">>, UserPassword}
-                               ,{<<"priv_level">>, <<"admin">>}
+                                 %% `priv_level' здесь НЕ задаётся: значение
+                                 %% берётся из `?MK_USER' и равно `user'.
+                                 %% Хардкод `admin' снят 18.08.2026 (В-32,
+                                 %% issue 51): автосоздание дока на ПЕРВОМ
+                                 %% логине через KC (`cb_zkeycloak_ext:
+                                 %% ensure_user_doc/5') делало админом любого,
+                                 %% кто впервые вошёл. Выдавать `admin' вправе
+                                 %% только строго вышестоящий в дереве аккаунт
+                                 %% либо superduper — гвард
+                                 %% `cb_users:maybe_deny_admin_grant/2'.
                                ,{<<"auth_origin">>, AuthOrigin}
                                ]),
     DbName = kzs_util:format_account_db(AccountId),

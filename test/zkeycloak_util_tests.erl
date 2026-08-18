@@ -1011,7 +1011,17 @@ create_user_auth_origin_test_() ->
                        ?assertEqual(<<"ivan@example.com">>, captured(<<"username">>)),
                        ?assertEqual(<<"Ivan">>, captured(<<"first_name">>)),
                        ?assertEqual(<<"Petrov">>, captured(<<"last_name">>)),
-                       ?assertEqual(<<"admin">>, captured(<<"priv_level">>))
+                       ?assertEqual(<<"user">>, captured(<<"priv_level">>))
+               end}
+             ,{"create-путь НЕ выдаёт priv_level=admin (В-32, issue 51):"
+               " автосоздание дока на ПЕРВОМ логине через KC делало админом"
+               " любого вошедшего, мимо гварда cb_users",
+               fun() ->
+                       _ = create_user([<<"kis">>]),
+                       %% двусторонне: `admin' исчез И поле осталось на месте —
+                       %% пропажа ключа дала бы «админа нет» пустым нулём
+                       ?assertEqual(<<"user">>, captured(<<"priv_level">>)),
+                       ?assertNotEqual('undefined', captured(<<"username">>))
                end}
              ]
      end}.
