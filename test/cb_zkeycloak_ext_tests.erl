@@ -269,13 +269,10 @@ check_user_doc(Mode) ->
                                     ?ACCOUNT_ID, ?OWNER_ID, #{}).
 
 %%%=============================================================================
-%%% logout `id_token_hint' — транспорт POST-тело vs GET-query (issue 02 волна 2)
+%%% logout `id_token_hint' — только POST-тело (issue 02 волна 2)
 %%%
 %%% GET клал сырой id_token (ПДн) в query-string → он оседал в access-логах
-%%% nginx/бэкенда. POST переносит hint в JSON-тело. GET сохранён на переходный
-%%% период. `logout_id_token_hint/1' — точка выбора источника (открыта для
-%%% теста через `-ifdef(TEST). -export'); downstream (`logout_url/1' → KC
-%%% end_session) для обеих веток идентичен и здесь не дублируется.
+%%% nginx/бэкенда. POST переносит hint в JSON-тело. GET не поддерживается.
 %%%=============================================================================
 
 %% Зеркалят `kazoo_web.hrl' — чтобы не тащить include-цепочку crossbar в тест.
@@ -289,11 +286,14 @@ logout_hint_from_post_body_test() ->
     Ctx = cb_context:set_req_data(Ctx0, kz_json:from_list([{<<"id_token_hint">>, ?HINT}])),
     ?assertEqual(?HINT, cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
 
-logout_hint_from_get_query_test() ->
-    %% GET (legacy) — hint из query-string; поведение сохранено дословно.
+logout_hint_from_get_query_is_rejected_test() ->
+    %% GET не является поддержанным транспортом: JWT нельзя брать из URL.
     Ctx0 = cb_context:set_req_verb(cb_context:new(), ?HTTP_GET),
     Ctx = cb_context:set_query_string(Ctx0, kz_json:from_list([{<<"id_token_hint">>, ?HINT}])),
-    ?assertEqual(?HINT, cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
+    ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
+
+logout_route_is_post_only_test() ->
+    ?assertEqual([?HTTP_POST], cb_zkeycloak_ext:allowed_methods(<<"logout">>)).
 
 logout_post_ignores_query_hint_test() ->
     %% Подтверждение смены транспорта: POST-ветка НЕ читает QS, поэтому hint,
@@ -303,8 +303,8 @@ logout_post_ignores_query_hint_test() ->
     ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(Ctx)).
 
 logout_missing_hint_undefined_test() ->
-    %% Hint'а нет — обе ветки дают `undefined' (KC confirmation-page путь;
-    %% канон Option A: end_session всё равно уходит, но без silent-logout).
+    %% Hint'а нет — POST вернёт `undefined'; GET остаётся неподдержанным
+    %% независимо от наличия query-параметра.
     CtxPost = cb_context:set_req_verb(cb_context:new(), ?HTTP_POST),
     ?assertEqual('undefined', cb_zkeycloak_ext:logout_id_token_hint(CtxPost)),
     CtxGet = cb_context:set_req_verb(cb_context:new(), ?HTTP_GET),

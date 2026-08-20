@@ -1,12 +1,13 @@
 -module(cb_zkeycloak_ext).
 
 -export([init/0
-        ,allowed_methods/0, allowed_methods/1
-        ,resource_exists/0, resource_exists/1
-        ,authorize/1, authorize/2
-        ,authenticate/1, authenticate/2
-        ,validate/1,validate/2
-        ,post/1, post/2
+        ,request_data/1, request_data/2, request_data/3
+        ,allowed_methods/0, allowed_methods/1, allowed_methods/2
+        ,resource_exists/0, resource_exists/1, resource_exists/2
+        ,authorize/1, authorize/2, authorize/3
+        ,authenticate/1, authenticate/2, authenticate/3
+        ,validate/1, validate/2, validate/3
+        ,post/1, post/2, post/3
         ]).
 
 -include("/opt/kazoo/applications/crossbar/src/crossbar.hrl").
@@ -28,6 +29,8 @@
 -define(AUTH_CALLBACK, <<"auth_callback">>).
 -define(KERBEROS_LOGIN, <<"kerberos_login">>).
 -define(LOGOUT, <<"logout">>).
+-define(ACK, <<"ack">>).
+-define(BACKCHANNEL, <<"backchannel">>).
 -define(REFRESH, <<"refresh">>).
 -define(ZKEYCLOAK, <<"zkeycloak_ext">>).
 
@@ -49,22 +52,79 @@
 -define(PROVIDER_UNAVAILABLE_ERROR, 'oidc_provider_unavailable').
 -define(PROVIDER_UNAVAILABLE_MSG, <<"identity provider is not available, retry later">>).
 
-%% Ключ хэнд-овера validate -> post (execute-фаза, issue 22). Мутирующий
-%% POST-путь в модуле РОВНО ОДИН — `?REFRESH': обмен refresh-токена в KC
-%% (провайдер РОТИРУЕТ токен, т.е. вызов необратим) плюс выпуск Kazoo-токена.
-%% Значение тегировано путём; отсутствие тега = разрыв хэнд-овера (окно
-%% hotload-скью) ⇒ повторного обмена уже потраченным токеном не будет.
+%% Ключ хэнд-овера validate -> post (execute-фаза, issue 22). Значения тегированы
+%% путём: refresh переносит authoritative binding до необратимой KC rotation;
+%% logout переносит только проверенные входы до begin/revoke/ack. Старое имя
+%% ключа сохраняется ради hotload-совместимости refresh. Отсутствие тега не
+%% запускает эффект повторно.
 -define(POST_HANDOVER, 'zkeycloak_ext_post_refresh').
+-define(SESSION_CONTEXT, 'zkeycloak_session_context').
 
+-define(LOGOUT_TRANSACTION_TTL_S, 300).
 -spec init() -> ok.
 init() ->
     _ = crossbar_bindings:bind(<<"*.authenticate.zkeycloak_ext">>, ?MODULE, 'authenticate'),
     _ = crossbar_bindings:bind(<<"*.authorize.zkeycloak_ext">>, ?MODULE, 'authorize'),
     _ = crossbar_bindings:bind(<<"*.allowed_methods.zkeycloak_ext">>, ?MODULE, 'allowed_methods'),
     _ = crossbar_bindings:bind(<<"*.resource_exists.zkeycloak_ext">>, ?MODULE, 'resource_exists'),
+    _ = crossbar_bindings:bind(<<"*.request_data.post.zkeycloak_ext">>, ?MODULE, 'request_data'),
     _ = crossbar_bindings:bind(<<"*.validate.zkeycloak_ext">>, ?MODULE, 'validate'),
     _ = crossbar_bindings:bind(<<"*.execute.post.zkeycloak_ext">>, ?MODULE, 'post'),
     ok.
+
+%% Keycloak Back-Channel Logout 1.0 sends a top-level form field rather than
+%% the Crossbar JSON envelope. Consume it before the generic form parser: that
+%% parser both rejects the top-level shape and logs the parsed object.
+-spec request_data(api_util:request_data_args()) -> 'false'.
+request_data({_Req, _Context, _ContentType, _QueryString}) ->
+    'false'.
+
+-spec request_data(api_util:request_data_args(), path_token()) -> 'false'.
+request_data({_Req, _Context, _ContentType, _QueryString}, _Token) ->
+    'false'.
+
+-spec request_data(api_util:request_data_args(), path_token(), path_token()) ->
+          'false' |
+          {'ok', cb_context:context(), cowboy_req:req()} |
+          {'error', 'invalid_credentials'}.
+request_data({Req0, Context, <<"application/x-www-form-urlencoded">>, QueryString},
+             ?LOGOUT, ?BACKCHANNEL) ->
+    case api_util:get_request_body(Req0) of
+        {'ok', Body, Req1} ->
+            case parse_backchannel_body(Body) of
+                {'ok', LogoutToken} ->
+                    lager:debug("accepted keycloak backchannel form body (~b bytes), token=~s",
+                                [byte_size(Body), zkeycloak_util:redact(LogoutToken)]),
+                    ReqData = kz_json:from_list([{<<"logout_token">>, LogoutToken}]),
+                    Ctx = cb_context:setters(
+                            Context,
+                            [{fun cb_context:set_req_data/2, ReqData}
+                            ,{fun cb_context:set_req_json/2, ReqData}
+                            ,{fun cb_context:set_query_string/2, QueryString}
+                            ]),
+                    {'ok', Ctx, Req1};
+                'error' ->
+                    lager:warning("rejected malformed keycloak backchannel form body (~b bytes)",
+                                  [byte_size(Body)]),
+                    {'error', 'invalid_credentials'}
+            end;
+        {'error', 'max_size', _Req1} ->
+            lager:warning("rejected oversized keycloak backchannel form body"),
+            {'error', 'invalid_credentials'}
+    end;
+request_data({_Req, _Context, _ContentType, _QueryString}, ?LOGOUT, ?BACKCHANNEL) ->
+    {'error', 'invalid_credentials'};
+request_data({_Req, _Context, _ContentType, _QueryString}, _Token1, _Token2) ->
+    'false'.
+
+-spec parse_backchannel_body(binary()) -> {'ok', kz_term:ne_binary()} | 'error'.
+parse_backchannel_body(Body) ->
+    try cow_qs:parse_qs(Body) of
+        [{<<"logout_token">>, Token}] when is_binary(Token), Token =/= <<>> -> {'ok', Token};
+        _ -> 'error'
+    catch
+        _:_ -> 'error'
+    end.
 
 -spec allowed_methods() -> http_methods().
 allowed_methods() -> [?HTTP_POST, ?HTTP_GET].
@@ -72,13 +132,14 @@ allowed_methods() -> [?HTTP_POST, ?HTTP_GET].
 allowed_methods(?AUTH_LINK) -> [?HTTP_GET];
 allowed_methods(?AUTH_CALLBACK) -> [?HTTP_GET];
 allowed_methods(?KERBEROS_LOGIN) -> [?HTTP_GET];
-%% logout: POST — целевой транспорт `id_token_hint' (в JSON-теле, не в
-%% query-string → не оседает в access-логах). GET оставлен на переходный
-%% период (старые бандлы/вкладки с закэшированным фронтом); его снятие —
-%% отдельный follow-up после раскатки фронта.
-allowed_methods(?LOGOUT) -> [?HTTP_GET, ?HTTP_POST];
+allowed_methods(?LOGOUT) -> [?HTTP_POST];
 allowed_methods(?REFRESH) -> [?HTTP_POST];
 allowed_methods(?ZKEYCLOAK) -> [?HTTP_POST, ?HTTP_GET].
+
+-spec allowed_methods(path_token(), path_token()) -> http_methods().
+allowed_methods(?LOGOUT, ?ACK) -> [?HTTP_POST];
+allowed_methods(?LOGOUT, ?BACKCHANNEL) -> [?HTTP_POST];
+allowed_methods(_Token1, _Token2) -> [].
 
 -spec resource_exists() -> boolean().
 resource_exists() -> 'true'.
@@ -89,6 +150,11 @@ resource_exists(?KERBEROS_LOGIN) -> 'true';
 resource_exists(?LOGOUT) -> 'true';
 resource_exists(?REFRESH) -> 'true';
 resource_exists(?ZKEYCLOAK) -> 'true'.
+
+-spec resource_exists(path_token(), path_token()) -> boolean().
+resource_exists(?LOGOUT, ?ACK) -> 'true';
+resource_exists(?LOGOUT, ?BACKCHANNEL) -> 'true';
+resource_exists(_Token1, _Token2) -> 'false'.
 
 -spec authorize(cb_context:context()) -> boolean() | {'stop', cb_context:context()}.
 authorize(Context) ->
@@ -116,6 +182,11 @@ authorize(Context, Token1) ->
     lager:info("authorisze/2 req_id: ~p",[cb_context:req_id(Context)]),
     authorize_nouns(Context, cb_context:req_nouns(Context), cb_context:req_verb(Context)).
 
+
+-spec authorize(cb_context:context(), path_token(), path_token()) -> boolean().
+authorize(_Context, ?LOGOUT, ?ACK) -> 'true';
+authorize(_Context, ?LOGOUT, ?BACKCHANNEL) -> 'true';
+authorize(_Context, _Token1, _Token2) -> 'false'.
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, []}], Method) when Method =:= ?HTTP_POST ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing zkeycloak_ext"),
     'true';
@@ -129,9 +200,7 @@ authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"kerberos_login">>]}], Metho
     lager:info("authorize_nouns_zkeycloak_ext authorizing kerberos_login"),
     'true';
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"logout">>]}], Method)
-  when Method =:= ?HTTP_GET;
-       Method =:= ?HTTP_POST ->
-    %% POST — новый транспорт `id_token_hint' (тело), GET — legacy-совместимость.
+  when Method =:= ?HTTP_POST ->
     lager:info("authorize_nouns_zkeycloak_ext authorizing logout"),
     'true';
 authorize_nouns(_Context, [{<<"zkeycloak_ext">>, [<<"refresh">>]}], Method) when Method =:= ?HTTP_POST ->
@@ -152,6 +221,11 @@ authenticate(Context, Token1) ->
     lager:info("authenticate/2  Token1: ~p",[Token1]),
     lager:info("authenticate/2  req_nouns: ~p",[cb_context:req_nouns(Context)]),
     authenticate_nouns(Context, cb_context:req_nouns(Context)).
+
+-spec authenticate(cb_context:context(), path_token(), path_token()) -> boolean().
+authenticate(_Context, ?LOGOUT, ?ACK) -> 'true';
+authenticate(_Context, ?LOGOUT, ?BACKCHANNEL) -> 'true';
+authenticate(_Context, _Token1, _Token2) -> 'false'.
 
 authenticate_nouns(Context, [{<<"zkeycloak_ext">>, []}]) ->
     lager:info("authenticate_nouns/2  req_headers: ~p",[zkeycloak_util:redact_headers(cb_context:req_headers(Context))]),
@@ -229,7 +303,7 @@ validate(Context, ?AUTH_CALLBACK) ->
                } = TokenTuple} ->
 
             %% issue 01: id/access/refresh — живые bearer-креды (refresh ~30 дней).
-            %% Маскируем значения (префикс+длина); сам lager:info сохранён.
+            %% Оставляем только короткий SHA-256 fingerprint; lager:info сохранён.
             lager:info("validate_ext/2  TokenId: ~s",[zkeycloak_util:redact(TokenId)]),
             lager:info("validate_ext/2  TokenAccess: ~s",[zkeycloak_util:redact(TokenAccess)]),
             lager:info("validate_ext/2  TokenRefresh: ~s",[zkeycloak_util:redact(TokenRefresh)]),
@@ -238,7 +312,10 @@ validate(Context, ?AUTH_CALLBACK) ->
             %% whitelist служебных полей + ИМЕНА остальных (`redacted_keys').
             lager:info("validate_ext/2  ClaimsMap: ~p",[zkeycloak_util:claims_digest(ClaimsMap)]),
             lager:info("validate_ext/2  _Scope: ~p",[_Scope]),
-            authorize_and_issue(Context, TokenTuple, TokenAccess, TokenId, TokenRefresh, 'login');
+            SessionContext = keycloak_session_context(
+                               'login', ClaimsMap, TokenAccess, TokenRefresh),
+            authorize_and_issue(cb_context:store(Context, ?SESSION_CONTEXT, SessionContext),
+                                TokenTuple, TokenAccess, TokenId, TokenRefresh, 'login');
         %% issue 05: `retrieve_token/3' нормализован к {ok,_}|{error,_}. Битый/
         %% просроченный/уже-использованный `code' (invalid_grant, в т.ч. от гонки
         %% cancel→retry на MIUI — issue 06) или KC-недоступность → чистый 401
@@ -289,30 +366,7 @@ validate(Context, ?KERBEROS_LOGIN) ->
             cb_context:add_system_error('forbidden', Context)
     end;
 validate(Context, ?LOGOUT) ->
-    %% `id_token_hint' — сырой id_token (ПДн: `sub'/`email'/`name'). Фронт берёт
-    %% его из своего state (`kc_id_token', enrich_resp_with_kc_tokens/3 положил
-    %% его в auth-response). Без hint'а KC показывает confirmation page по
-    %% OIDC-спеке (канон Option A — logout всегда с hint'ом — не меняется).
-    %%
-    %% Транспорт hint'а до бэкенда:
-    %%   POST — целевой: hint в JSON-теле (`{"data":{"id_token_hint":…}}'),
-    %%          в access-логи nginx/бэкенда НЕ попадает;
-    %%   GET  — legacy: hint в query-string оседал в access-логах (та же
-    %%          утечка, что закрыл issue 01 для сырого URL в lager) — ветка
-    %%          сохранена на переходный период, снятие отдельным follow-up.
-    %% Downstream (KC end_session с hint) для обеих веток ИДЕНТИЧЕН.
-    IdTokenHint = logout_id_token_hint(Context),
-    LogoutUrl = zkeycloak_util:logout_url(IdTokenHint),
-    %% issue 01: LogoutUrl несёт `id_token_hint=<сырой id_token>' в query —
-    %% полный URL в лог писать нельзя. Логируем redacted-hint (он же сигналит
-    %% наличие/отсутствие hint'а: `undefined' = no); endpoint восстановим из
-    %% конфига. Тело POST здесь НЕ логируем сырым (в `authorize/2' оно уже
-    %% идёт через `redact_req_data/1' — `id_token_hint' в ?SENSITIVE_BODY_KEYS).
-    %% Сам lager:info сохранён.
-    lager:info("zkeycloak logout_url: verb=~s id_token_hint=~s"
-              ,[cb_context:req_verb(Context), zkeycloak_util:redact(IdTokenHint)]),
-    JObj = kz_json:set_value(<<"logout_url">>, LogoutUrl, kz_json:new()),
-    cb_context:set_resp_status(cb_context:set_resp_data(Context, JObj), 'success');
+    validate_logout_start(Context);
 %% @doc Обмен refresh_token → новый Kazoo auth_token + новый KC refresh/id.
 %% Mobile-клиенты (zfield) хранят `kc_refresh_token' в secure_storage под
 %% BiometricPrompt и дёргают эту ручку при cold-start (после биометрии) и
@@ -329,13 +383,7 @@ validate(Context, ?REFRESH) ->
         'undefined' ->
             lager:info("validate_ext/2 refresh: missing refresh_token in body"),
             cb_context:add_system_error('invalid_credentials', Context);
-        _ ->
-            %% сам обмен уехал в post/2 (issue 22): validate только проверяет,
-            %% что токен вообще прислан, — отказ 401 остаётся ДО обращения к KC
-            cb_context:set_resp_status(
-              cb_context:store(Context, ?POST_HANDOVER, {?REFRESH, RefreshToken})
-             ,'success'
-             )
+        _ -> validate_refresh_binding(Context, RefreshToken)
     end;
 validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_files: ~p",[cb_context:req_files(Context)]),
@@ -344,10 +392,36 @@ validate(Context, ?ZKEYCLOAK) ->
     lager:info("validate_ext/2  req_verb: ~p",[cb_context:req_verb(Context)]),
     lager:info("validate_ext/2  req_id: ~p",[cb_context:req_id(Context)]),
     zkeycloak_ext_post(Context).
+-spec validate(cb_context:context(), path_token(), path_token()) ->
+          cb_context:context().
+validate(Context, ?LOGOUT, ?BACKCHANNEL) ->
+    LogoutToken = kz_json:get_ne_binary_value(
+                    <<"logout_token">>, cb_context:req_data(Context)),
+    case LogoutToken of
+        'undefined' -> cb_context:add_system_error('invalid_credentials', Context);
+        _ ->
+            case zkeycloak_util:verify_backchannel_logout_token(LogoutToken) of
+                {'ok', Event} ->
+                    store_logout_handover(Context, {'backchannel', Event});
+                {'error', Reason} -> logout_validation_error(Context, Reason)
+            end
+    end;
+validate(Context, ?LOGOUT, ?ACK) ->
+    ReqData = cb_context:req_data(Context),
+    State = kz_json:get_ne_binary_value(<<"state">>, ReqData),
+    Verifier = kz_json:get_ne_binary_value(<<"verifier">>, ReqData),
+    case {State, Verifier} of
+        {'undefined', _} -> cb_context:add_system_error('invalid_credentials', Context);
+        {_, 'undefined'} -> cb_context:add_system_error('invalid_credentials', Context);
+        _ -> store_logout_handover(Context, {'ack', State, Verifier})
+    end;
+validate(Context, _Token1, _Token2) ->
+    cb_context:add_system_error('not_found', Context).
+
 
 %%------------------------------------------------------------------------------
-%% @doc execute-фаза (issue 22). Мутирующий verb у модуля один — POST, но
-%% эффект есть ровно у ОДНОГО из его путей.
+%% @doc execute-фаза (issue 22). Все необратимые refresh/logout эффекты
+%% выполняются после успешной validate-фазы и определяются тегом пути.
 %%
 %% `?REFRESH' — эффект: обмен refresh-токена в Keycloak НЕОБРАТИМ (KC ротирует
 %% токен, повторный обмен тем же значением даёт `invalid_grant') и завершается
@@ -356,12 +430,8 @@ validate(Context, ?ZKEYCLOAK) ->
 %% бы 500 клиенту, у которого refresh-токен УЖЕ потрачен, а новый он не увидел —
 %% mobile-клиент уходил бы в полный AppAuth-flow на ровном месте.
 %%
-%% `/', `?ZKEYCLOAK', `?LOGOUT' — мутации нет вовсе: первые два только логируют,
-%% третий СОБИРАЕТ url разлогина и кладёт его в resp_data. Конверт этих путей
-%% готовит validate, и это не «эффект, оставленный в validate»: у `?LOGOUT' жив
-%% legacy-GET (переходный период), а у GET execute-фазы нет вообще — перенос
-%% сборки ответа в коллбэк оставил бы GET-ветку без него. Коллбэк здесь только
-%% восстанавливает success поверх fatal/500-пресета фолда.
+%% `/' и `?ZKEYCLOAK' мутаций не выполняют; POST logout применяет эффект только
+%% в execute.
 %% @end
 %%------------------------------------------------------------------------------
 -spec post(cb_context:context()) -> cb_context:context().
@@ -372,7 +442,7 @@ post(Context) ->
 post(Context, ?REFRESH) ->
     execute_refresh(Context, cb_context:fetch(Context, ?POST_HANDOVER));
 post(Context, ?LOGOUT) ->
-    post_reply(Context);
+    execute_logout_start(Context, cb_context:fetch(Context, ?POST_HANDOVER));
 post(Context, ?ZKEYCLOAK) ->
     post_reply(Context);
 post(Context, _Path) ->
@@ -382,15 +452,132 @@ post(Context, _Path) ->
     lager:info("execute post for non-mutating path ~s, nothing to apply", [_Path]),
     Context.
 
+-spec post(cb_context:context(), path_token(), path_token()) -> cb_context:context().
+post(Context, ?LOGOUT, ?BACKCHANNEL) ->
+    execute_backchannel(Context, cb_context:fetch(Context, ?POST_HANDOVER));
+post(Context, ?LOGOUT, ?ACK) ->
+    execute_logout_ack(Context, cb_context:fetch(Context, ?POST_HANDOVER));
+post(Context, _Token1, _Token2) ->
+    Context.
+
 %%%=============================================================================
 %%% Internal functions
 %%%=============================================================================
 
-%% Конверт, собранный validate'ом (у не-мутирующих путей он и есть ответ),
-%% поверх вендорного fatal/500-пресета фолда.
+%% @doc Validate the signed ID-token hint and bind it to the server-side SID
+%% record before creating a logout transaction. No persistent effect occurs in
+%% validate; Crossbar execute owns all mutations.
+-spec validate_logout_start(cb_context:context()) -> cb_context:context().
+validate_logout_start(Context) ->
+    IdTokenHint = logout_id_token_hint(Context),
+    case IdTokenHint of
+        'undefined' -> cb_context:add_system_error('invalid_credentials', Context);
+        _ ->
+            case zkeycloak_util:verify_logout_id_token(IdTokenHint) of
+                {'ok', #{'sid' := Sid, 'sub' := Sub,
+                         'account_id' := AccountId}} ->
+                    case zcore_util:from_key(Sub, 'undefined') of
+                        'undefined' ->
+                            cb_context:add_system_error('invalid_credentials', Context);
+                        OwnerId ->
+                            store_logout_handover(
+                              Context,
+                              {'logout_start', IdTokenHint, AccountId, OwnerId, Sid})
+                    end;
+                {'error', Reason} -> logout_validation_error(Context, Reason)
+            end
+    end.
+
+-spec store_logout_handover(cb_context:context(), tuple()) -> cb_context:context().
+store_logout_handover(Context, Handover) ->
+    cb_context:set_resp_status(
+      cb_context:store(Context, ?POST_HANDOVER, Handover), 'success').
+
+-spec logout_validation_error(cb_context:context(), any()) -> cb_context:context().
+logout_validation_error(Context, Reason) ->
+    lager:warning("keycloak logout token validation failed: ~p",
+                  [zkeycloak_util:redact_reason(Reason)]),
+    cb_context:add_system_error('invalid_credentials', Context).
+
+-spec execute_logout_start(cb_context:context(), any()) -> cb_context:context().
+execute_logout_start(Context,
+                     {'logout_start', IdTokenHint, AccountId, OwnerId, Sid}) ->
+    TtlS = ?LOGOUT_TRANSACTION_TTL_S,
+    case kz_auth_session_family:begin_logout(AccountId, OwnerId, Sid, TtlS) of
+        {'ok', #{'state' := State, 'verifier' := Verifier}} ->
+            LogoutUrl = zkeycloak_util:logout_url(IdTokenHint, State),
+            Resp = kz_json:from_list([{<<"logout_url">>, LogoutUrl}
+                                     ,{<<"state">>, State}
+                                     ,{<<"verifier">>, Verifier}
+                                     ,{<<"kazoo_status">>, <<"pending">>}
+                                     ,{<<"keycloak_status">>, <<"pending">>}]),
+            cb_context:set_resp_status(
+              cb_context:set_resp_data(Context, Resp), 'success');
+        {'error', Reason} -> logout_backend_error(Context, Reason)
+    end;
+execute_logout_start(Context, _NoHandover) -> Context.
+
+-spec execute_backchannel(cb_context:context(), any()) -> cb_context:context().
+execute_backchannel(Context,
+                    {'backchannel', #{'sid' := Sid, 'jti' := Jti,
+                                      'expires_at' := ExpiresAt}}) ->
+    case kz_auth_session_family:revoke_kc_sid(Sid, Jti, ExpiresAt) of
+        {'ok', Result} when Result =:= 'op_revoked'; Result =:= 'replayed' ->
+            cb_context:set_resp_status(
+              cb_context:set_resp_data(Context, kz_json:new()), 'success');
+        {'error', Reason} -> logout_backend_error(Context, Reason)
+    end;
+execute_backchannel(Context, _NoHandover) -> Context.
+
+-spec execute_logout_ack(cb_context:context(), any()) -> cb_context:context().
+execute_logout_ack(Context, {'ack', State, Verifier}) ->
+    case kz_auth_session_family:ack_logout(State, Verifier) of
+        {'ok', _Transaction} ->
+            Resp = kz_json:from_list([{<<"kazoo_status">>, <<"revoked">>}
+                                     ,{<<"keycloak_status">>, <<"confirmed">>}]),
+            cb_context:set_resp_status(
+              cb_context:set_resp_data(Context, Resp), 'success');
+        {'error', Reason} -> logout_backend_error(Context, Reason)
+    end;
+execute_logout_ack(Context, _NoHandover) -> Context.
+
+-spec logout_backend_error(cb_context:context(), any()) -> cb_context:context().
+logout_backend_error(Context, Reason) ->
+    lager:warning("keycloak logout state transition failed: ~p",
+                  [zkeycloak_util:redact_reason(Reason)]),
+    case Reason of
+        'invalid_logout_verifier' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'invalid_logout_transaction' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'not_found' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'binding_identity_mismatch' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'invalid_binding_state' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'invalid_session_binding' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'logout_event_expired' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'logout_event_replay_mismatch' ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        'logout_transaction_expired' ->
+            cb_context:add_system_error(
+              409, 'logout_transaction_expired',
+              <<"logout transaction expired, start logout again">>, Context);
+        'keycloak_logout_unconfirmed' ->
+            cb_context:add_system_error(
+              409, 'keycloak_logout_unconfirmed',
+              <<"identity provider logout is not confirmed yet">>, Context);
+        _ -> auth_store_error(Context)
+    end.
+
+%% Восстановить validate-конверт поверх fatal/500-пресета Crossbar-фолда.
 -spec post_reply(cb_context:context()) -> cb_context:context().
 post_reply(Context) ->
     cb_context:set_resp_status(Context, 'success').
+
 
 %% Разрыв хэнд-овера (окно hotload-скью: validate прошёл на СТАРОМ биме и обмен
 %% там уже сделал) — второго обмена НЕ делаем: refresh-токен запроса к этому
@@ -398,8 +585,8 @@ post_reply(Context) ->
 %% выбросив клиента в полный AppAuth-flow. Клиент получает fatal/500-пресет и
 %% ретраит после раскатки.
 -spec execute_refresh(cb_context:context(), any()) -> cb_context:context().
-execute_refresh(Context, {?REFRESH, RefreshToken}) ->
-    handle_refresh(Context, RefreshToken);
+execute_refresh(Context, {?REFRESH, RefreshToken, BindingMode}) ->
+    handle_refresh(Context, RefreshToken, BindingMode);
 execute_refresh(Context, _NoHandover) ->
     lager:info("execute post refresh without validate handover, refusing to exchange token"),
     Context.
@@ -468,30 +655,26 @@ zkeycloak_ext_post(Context) ->
     lager:info("zkeycloak_ext_post/1 req_json: ~p",[zkeycloak_util:redact_req_data(ReqJSON)]),
     cb_context:set_resp_status(cb_context:set_resp_data(Context, kz_json:new()), 'success').
 
-%% @doc Достать `id_token_hint' для logout из тела (POST) или query-string (GET).
-%% POST — целевой транспорт: hint (сырой id_token c ПДн) в JSON-теле НЕ
-%% попадает в access-логи, в отличие от GET-query. `req_data/1' читает
+%% @doc Достать `id_token_hint' для logout только из POST-тела. `req_data/1' читает
 %% inner-объект `data'-конверта тела (crossbar-конвенция `{"data":{…}}',
-%% симметрично `validate(?REFRESH)'); `query_string/1' — GET-параметры.
-%% GET-ветка — legacy на переходный период (старые бандлы).
+%% симметрично `validate(?REFRESH)'). JWT в query-string не поддерживается.
 -spec logout_id_token_hint(cb_context:context()) -> kz_term:api_ne_binary().
 logout_id_token_hint(Context) ->
-    Source = case cb_context:req_verb(Context) of
-                 ?HTTP_POST -> cb_context:req_data(Context);
-                 _ -> cb_context:query_string(Context)
-             end,
-    kz_json:get_ne_binary_value(<<"id_token_hint">>, Source).
+    case cb_context:req_verb(Context) of
+        ?HTTP_POST -> kz_json:get_ne_binary_value(<<"id_token_hint">>, cb_context:req_data(Context));
+        _ -> 'undefined'
+    end.
 
 %% @doc Обмен refresh_token на KC и формирование Kazoo-сессии.
 %% Структура oidcc-tuple строится в zkeycloak_util:retrieve_token; здесь
 %% подхватываем её один-в-один (`oidcc_token_*' records определены в
 %% `oidcc/include/oidcc_token.hrl').
--spec handle_refresh(cb_context:context(), kz_term:ne_binary()) ->
+-spec handle_refresh(cb_context:context(), kz_term:ne_binary(), any()) ->
           cb_context:context().
-handle_refresh(Context, RefreshToken) ->
+handle_refresh(Context, RefreshToken, BindingMode) ->
     case zkeycloak_util:refresh_token(RefreshToken) of
         {'ok', {oidcc_token
-               ,{oidcc_token_id, NewTokenId, _ClaimsMap}
+               ,{oidcc_token_id, NewTokenId, ClaimsMap}
                ,{oidcc_token_access, NewTokenAccess, _Timeout, _Type}
                ,{oidcc_token_refresh, NewTokenRefresh}
                ,_Scope
@@ -499,7 +682,11 @@ handle_refresh(Context, RefreshToken) ->
             %% issue 01: маскируем новые токены (ротированный refresh валиден ~30 дней).
             lager:info("handle_refresh: ok, new_access=~s new_refresh=~s",
                        [zkeycloak_util:redact(NewTokenAccess), zkeycloak_util:redact(NewTokenRefresh)]),
-            authorize_and_issue(Context, TokenTuple, NewTokenAccess, NewTokenId,
+            SessionContext = keycloak_session_context(
+                               {'refresh', BindingMode}, ClaimsMap,
+                               NewTokenAccess, NewTokenRefresh),
+            authorize_and_issue(cb_context:store(Context, ?SESSION_CONTEXT, SessionContext),
+                                TokenTuple, NewTokenAccess, NewTokenId,
                                 NewTokenRefresh, 'refresh');
         {'error', Reason} ->
             %% P3 (кросс-ревью 18.07): тот же класс, что auth_callback —
@@ -525,7 +712,77 @@ handle_refresh(Context, RefreshToken) ->
 %% выдаём Kazoo-токен либо мапим отказ. `retrieve_userinfo/1' нормализован
 %% (issue 05) к {ok,_}|{error,_} — сбой userinfo (сетевой к KC) даёт чистый
 %% 401 `invalid_credentials' вместо badmatch-500. Ранее эта ветка (userinfo +
+
+%% @doc Resolve the authoritative refresh binding before the irreversible
+%% Keycloak exchange. Unknown legacy credentials cross only the rollout gate;
+%% uncertain storage is retryable and never becomes a provider call.
+-spec validate_refresh_binding(cb_context:context(), kz_term:ne_binary()) ->
+          cb_context:context().
+validate_refresh_binding(Context, RefreshToken) ->
+    case kz_auth_session_family:lookup_refresh(RefreshToken) of
+        {'ok', Binding} ->
+            store_refresh_handover(Context, RefreshToken, Binding);
+        {'error', 'not_found'} ->
+            case kz_auth_session_family:legacy_refresh_allowed() of
+                'true' -> store_refresh_handover(Context, RefreshToken, 'legacy');
+                'false' -> cb_context:add_system_error('invalid_credentials', Context)
+            end;
+        {'error', 'session_revoked'} ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        {'error', 'invalid_session_binding'} ->
+            cb_context:add_system_error('invalid_credentials', Context);
+        {'error', Reason} ->
+            lager:warning("refresh binding lookup failed: ~p",
+                          [zkeycloak_util:redact_reason(Reason)]),
+            auth_store_error(Context)
+    end.
+
+-spec store_refresh_handover(cb_context:context(), kz_term:ne_binary(), any()) ->
+          cb_context:context().
+store_refresh_handover(Context, RefreshToken, BindingMode) ->
+    cb_context:set_resp_status(
+      cb_context:store(
+        Context, ?POST_HANDOVER, {?REFRESH, RefreshToken, BindingMode}),
+      'success').
+
+-spec auth_store_error(cb_context:context()) -> cb_context:context().
+auth_store_error(Context) ->
+    cb_context:add_system_error(
+      503, 'auth_store_unavailable',
+      <<"session state storage is unavailable, retry later">>, Context).
 %% role-gate) дублировалась дословно в auth_callback'е и handle_refresh.
+-spec keycloak_session_context('login' | {'refresh', any()}, map(),
+                               kz_term:ne_binary(), kz_term:ne_binary()) -> any().
+keycloak_session_context(Mode, ClaimsMap, TokenAccess, RefreshToken) ->
+    AccessClaims = zkeycloak_util:jwt_claims(TokenAccess),
+    Sid = claim_value([<<"sid">>, <<"session_state">>], ClaimsMap, AccessClaims),
+    TokenExpiresAt = claim_value([<<"exp">>], ClaimsMap, AccessClaims),
+    ExpiresAt = zkeycloak_util:refresh_expires_at(RefreshToken, TokenExpiresAt),
+    case {Sid, ExpiresAt} of
+        {'undefined', _} -> {'error', 'keycloak_sid_missing'};
+        {_, Expiry} when is_integer(Expiry), Expiry > 0 ->
+            case Mode of
+                'login' -> {'login', Sid, Expiry};
+                {'refresh', Binding} -> {'refresh', Binding, Sid, Expiry}
+            end;
+        _ -> {'error', 'keycloak_session_expiry_missing'}
+    end.
+-spec claim_value([kz_term:ne_binary(), ...], map(), kz_term:proplist()) -> any().
+claim_value(Keys, ClaimsMap, AccessClaims) ->
+    case map_claim(Keys, ClaimsMap) of
+        'undefined' -> props:get_first_defined(Keys, AccessClaims);
+        Value -> Value
+    end.
+
+-spec map_claim([kz_term:ne_binary()], map()) -> any().
+map_claim([Key | Rest], ClaimsMap) ->
+    case kz_maps:get(Key, ClaimsMap, 'undefined') of
+        'undefined' -> map_claim(Rest, ClaimsMap);
+        'null' -> map_claim(Rest, ClaimsMap);
+        Value -> Value
+    end;
+map_claim([], _ClaimsMap) -> 'undefined'.
+
 -spec authorize_and_issue(cb_context:context()
                          ,tuple()
                          ,kz_term:ne_binary()
@@ -892,7 +1149,46 @@ reject_user_provisioning(Context, 'login', _Reason) ->
     cb_context:add_system_error('unspecified_fault', Context).
 
 %% @doc Выпуск Kazoo auth-token'а + обогащение KC-токенами.
+-spec prepare_keycloak_session(cb_context:context(), kz_term:ne_binary(),
+                               kz_term:ne_binary(), kz_term:ne_binary()) ->
+          {'ok', cb_context:context()} | {'error', any()}.
+prepare_keycloak_session(Context, AccountId, OwnerId, TokenRefresh) ->
+    case cb_context:fetch(Context, ?SESSION_CONTEXT) of
+        'undefined' -> {'ok', Context};
+        {'error', Reason} -> {'error', Reason};
+        {'login', Sid, ExpiresAt} ->
+            bind_session_result(Context, Sid,
+              kz_auth_session_family:create_keycloak_session(
+                AccountId, OwnerId, Sid, TokenRefresh, ExpiresAt));
+        {'refresh', 'legacy', Sid, ExpiresAt} ->
+            bind_session_result(Context, Sid,
+              kz_auth_session_family:create_keycloak_session(
+                AccountId, OwnerId, Sid, TokenRefresh, ExpiresAt));
+        {'refresh', Binding, Sid, ExpiresAt} ->
+            bind_session_result(Context, Sid,
+              kz_auth_session_family:rotate_keycloak_session(
+                Binding, TokenRefresh, Sid, AccountId, OwnerId, ExpiresAt))
+    end.
+
+-spec bind_session_result(cb_context:context(), kz_term:ne_binary(), any()) ->
+          {'ok', cb_context:context()} | {'error', any()}.
+bind_session_result(Context, Sid, {'ok', Family}) ->
+    {'ok', cb_context:store(Context, 'auth_session_family_mode',
+                            {'inherit_keycloak', Family, Sid})};
+bind_session_result(_Context, _Sid, {'error', _}=Error) -> Error.
 %% `TokenAccess' в аргументах больше НЕТ: он был нужен только ради
+
+-spec keycloak_session_error(cb_context:context(), any()) -> cb_context:context().
+keycloak_session_error(Context, Reason) ->
+    lager:warning("keycloak session binding failed: ~p",
+                  [zkeycloak_util:redact_reason(Reason)]),
+    case Reason of
+        'session_revoked' -> cb_context:add_system_error('invalid_credentials', Context);
+        'binding_identity_mismatch' -> cb_context:add_system_error('invalid_credentials', Context);
+        'refresh_replay' -> cb_context:add_system_error('invalid_credentials', Context);
+        'invalid_session_binding' -> cb_context:add_system_error('invalid_credentials', Context);
+        _ -> auth_store_error(Context)
+    end.
 %% `auth_method/1', а тот теперь считается один раз в `provide_keycloak_token/9'
 %% и приезжает сюда готовым. Значение в auth-doc'е от этого не меняется —
 %% тот же атом, та же `kz_term:to_binary/1'.
@@ -907,6 +1203,25 @@ reject_user_provisioning(Context, 'login', _Reason) ->
                       ) -> cb_context:context().
 issue_auth_token(Context, TokenId, TokenRefresh, UserInfoMap,
                  AccountId, OwnerId, AuthMethodAtom, AuthSource) ->
+    case prepare_keycloak_session(Context, AccountId, OwnerId, TokenRefresh) of
+        {'ok', BoundContext} ->
+            issue_bound_auth_token(BoundContext, TokenId, TokenRefresh, UserInfoMap,
+                                   AccountId, OwnerId, AuthMethodAtom, AuthSource);
+        {'error', Reason} ->
+            keycloak_session_error(Context, Reason)
+    end.
+
+-spec issue_bound_auth_token(cb_context:context()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,map()
+                            ,kz_term:ne_binary()
+                            ,kz_term:ne_binary()
+                            ,'oidc' | 'kerberos'
+                            ,zkeycloak_util:auth_source()
+                            ) -> cb_context:context().
+issue_bound_auth_token(Context, TokenId, TokenRefresh, UserInfoMap,
+                       AccountId, OwnerId, AuthMethodAtom, AuthSource) ->
     UserInfoJObj = kz_json:from_map(UserInfoMap),
     %% issue 15: `UserInfoJObj' — те же claim'ы, что и выше, только в
     %% JObj-форме; сырой `~p' дублировал утечку ПДн. Логируем выжимку из

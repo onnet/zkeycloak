@@ -49,8 +49,8 @@ redact_empty_test() ->
 redact_binary_masks_tail_test() ->
     Secret = <<"Bearer eyJhbGciOiJ-secret-tail-9f8e7d">>,
     Masked = zkeycloak_util:redact(Secret),
-    %% сохранён только короткий префикс + длина; хвост секрета отсутствует.
-    ?assertMatch(<<"Bearer", _/binary>>, Masked),
+    %% Сохранён только короткий SHA-256 fingerprint + длина.
+    ?assertMatch(<<"sha256:", _/binary>>, Masked),
     ?assertEqual('nomatch', binary:match(Masked, <<"secret-tail-9f8e7d">>)),
     ?assert(byte_size(Masked) < byte_size(Secret)).
 
@@ -64,16 +64,18 @@ redact_total_on_client_shaped_terms_test() ->
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact([1000])),
     ?assertEqual(<<"redacted(unprintable)">>, zkeycloak_util:redact(#{'a' => 1})),
     %% печатаемые не-binary формы маскируются, а не глушатся
-    ?assertEqual(<<"redacted(len=7)">>, zkeycloak_util:redact({[{<<"a">>,1}]})),
-    ?assertEqual(<<"redacted(len=5)">>, zkeycloak_util:redact(12345)).
+    ?assertMatch(<<"sha256:", _/binary>>, zkeycloak_util:redact({[{<<"a">>,1}]})),
+    ?assertMatch(<<"sha256:", _/binary>>, zkeycloak_util:redact(12345)).
 
 redact_short_secret_hides_prefix_test() ->
     %% `min(6, Len)' выдавал короткий секрет целиком; в ?SENSITIVE_BODY_KEYS
     %% есть `password', который короткий по природе.
-    ?assertEqual(<<"redacted(len=7)">>, zkeycloak_util:redact(<<"hunter7">>)),
-    %% на границе порога префикс появляется — и это малая доля секрета
+    Short = zkeycloak_util:redact(<<"hunter7">>),
+    ?assertMatch(<<"sha256:", _/binary>>, Short),
+    ?assertEqual('nomatch', binary:match(Short, <<"hunter7">>)),
+    %% На длинном значении также нет обратимого префикса.
     Long = <<"abcdefghijklmnopqrstuvwx">>, %% ровно 24
-    ?assertEqual(<<"abcdef..(len=24)">>, zkeycloak_util:redact(Long)).
+    ?assertEqual('nomatch', binary:match(zkeycloak_util:redact(Long), <<"abcdef">>)).
 
 redact_pii_never_reveals_prefix_test() ->
     %% ПДн: префикс не печатаем совсем — 6 байт email'а это всё ещё ПДн,
@@ -416,6 +418,19 @@ jwt_sub_unverified_happy_path_test() ->
     Token = <<"hdr.", Payload/binary, ".sig">>,
     ?assertEqual(?SUB, zkeycloak_util:jwt_sub_unverified(Token)).
 
+
+refresh_expires_at_uses_trusted_refresh_exp_test() ->
+    RefreshExp = 2000003600,
+    Payload = base64:encode(
+                kz_json:encode(
+                  kz_json:from_list([{<<"sub">>, ?SUB}, {<<"exp">>, RefreshExp}])),
+                #{'mode' => 'urlsafe', 'padding' => 'false'}),
+    Token = <<"hdr.", Payload/binary, ".sig">>,
+    ?assertEqual(RefreshExp, zkeycloak_util:refresh_expires_at(Token, 2000000000)),
+    ?assertEqual(RefreshExp + 1,
+                 zkeycloak_util:refresh_expires_at(Token, RefreshExp + 1)),
+    ?assertEqual(2000000000,
+                 zkeycloak_util:refresh_expires_at(<<"opaque-refresh">>, 2000000000)).
 %%%=============================================================================
 %%% redact_token_result/1 — fail-closed на неузнанной ok-форме (issue 15)
 %%%=============================================================================
@@ -1050,3 +1065,109 @@ create_user_setup() ->
 create_user_cleanup(_) ->
     _ = (catch meck:unload('kzd_users')),
     'ok'.
+%%%=============================================================================
+%%% OIDC logout claim validation. Signature verification is covered by the
+%%% production wrappers; this pure seam pins identity and event constraints.
+%%%=============================================================================
+
+-define(LOGOUT_ISSUER, <<"https://keycloak.example/realms/BRT">>).
+-define(LOGOUT_CLIENT, <<"onbill_client">>).
+-define(LOGOUT_SID, <<"kc-session-1">>).
+-define(LOGOUT_SUB, <<"01234567-89ab-cdef-0123-456789abcdef">>).
+-define(LOGOUT_ACCOUNT, <<"fedcba9876543210fedcba9876543210">>).
+-define(LOGOUT_EVENT,
+        <<"http://schemas.openid.net/event/backchannel-logout">>).
+
+logout_claim_validation_test_() ->
+    Now = 2000000000,
+    IdClaims = #{<<"iss">> => ?LOGOUT_ISSUER
+                ,<<"aud">> => ?LOGOUT_CLIENT
+                ,<<"sub">> => ?LOGOUT_SUB
+                ,<<"sid">> => ?LOGOUT_SID
+                ,<<"account_id">> => ?LOGOUT_ACCOUNT
+                },
+    EventClaims = #{<<"iss">> => ?LOGOUT_ISSUER
+                   ,<<"aud">> => [?LOGOUT_CLIENT]
+                   ,<<"sid">> => ?LOGOUT_SID
+                   ,<<"jti">> => <<"logout-event-1">>
+                   ,<<"iat">> => Now - 1
+                   ,<<"exp">> => Now + 60
+                   ,<<"events">> => #{?LOGOUT_EVENT => #{}}
+                   },
+    [?_assertEqual(
+        {'ok', #{'sid' => ?LOGOUT_SID
+                ,'sub' => ?LOGOUT_SUB
+                ,'account_id' => ?LOGOUT_ACCOUNT}},
+        zkeycloak_util:validate_logout_id_claims(
+          IdClaims, ?LOGOUT_ISSUER, ?LOGOUT_CLIENT))
+    ,?_assertEqual(
+        {'error', 'logout_token_bad_audience'},
+        zkeycloak_util:validate_logout_id_claims(
+          IdClaims#{<<"aud">> => <<"foreign-client">>},
+          ?LOGOUT_ISSUER, ?LOGOUT_CLIENT))
+    ,?_assertEqual(
+        {'ok', #{'sid' => ?LOGOUT_SID
+                ,'jti' => <<"logout-event-1">>
+                ,'expires_at' => Now + 60}},
+        zkeycloak_util:validate_backchannel_claims(
+          EventClaims, ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
+    ,?_assertEqual(
+        {'error', 'logout_event_missing'},
+        zkeycloak_util:validate_backchannel_claims(
+          EventClaims#{<<"events">> => #{}},
+          ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
+    ,?_assertEqual(
+        {'error', 'logout_event_nonce_forbidden'},
+        zkeycloak_util:validate_backchannel_claims(
+          EventClaims#{<<"nonce">> => <<"must-not-exist">>},
+          ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
+    ,?_assertEqual(
+        {'error', 'logout_event_expired'},
+        zkeycloak_util:validate_backchannel_claims(
+          EventClaims#{<<"exp">> => Now},
+          ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
+    ,?_assertEqual(
+        {'error', 'logout_token_bad_issuer'},
+        zkeycloak_util:validate_backchannel_claims(
+          EventClaims#{<<"iss">> => <<"https://foreign.example/realms/BRT">>},
+          ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
+    ].
+
+verify_backchannel_uses_unix_time_test_() ->
+    {'setup',
+     fun() ->
+             _ = (catch meck:unload('kz_auth_jwt')),
+             meck:new('kz_auth_jwt', ['no_link']),
+             'ok'
+     end,
+     fun(_) -> _ = (catch meck:unload('kz_auth_jwt')), 'ok' end,
+     fun(_) ->
+             Now = erlang:system_time('seconds'),
+             Issuer = kapps_config:get_ne_binary(
+                        <<"zkeycloak">>, <<"issuer">>, <<"issuer">>),
+             ClientId = kapps_config:get_ne_binary(
+                          <<"zkeycloak">>, <<"client_id">>, <<"client_id">>),
+             Claims = [{<<"iss">>, Issuer}
+                      ,{<<"aud">>, ClientId}
+                      ,{<<"sid">>, ?LOGOUT_SID}
+                      ,{<<"jti">>, <<"logout-event-current-time">>}
+                      ,{<<"iat">>, Now - 1}
+                      ,{<<"exp">>, Now + 60}
+                      ,{<<"events">>, #{?LOGOUT_EVENT => #{}}}
+                      ],
+             meck:expect('kz_auth_jwt', 'decode',
+                         fun(_Token, 'true') -> {'ok', [], Claims} end),
+             ?_assertMatch(
+                {'ok', #{'sid' := ?LOGOUT_SID,
+                         'jti' := <<"logout-event-current-time">>}},
+                zkeycloak_util:verify_backchannel_logout_token(
+                  <<"signed-logout-token">>))
+     end}.
+
+logout_sensitive_body_keys_test() ->
+    Body = kz_json:from_list([{<<"logout_token">>, <<"signed-secret">>}
+                            ,{<<"verifier">>, <<"private-secret">>}
+                            ,{<<"state">>, <<"correlation">>}]),
+    Redacted = zkeycloak_util:redact_req_data(Body),
+    ?assertNotEqual(<<"signed-secret">>, kz_json:get_value(<<"logout_token">>, Redacted)),
+    ?assertNotEqual(<<"private-secret">>, kz_json:get_value(<<"verifier">>, Redacted)).

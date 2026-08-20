@@ -20,6 +20,7 @@
         ,create_user/7
         ,create_user/8
         ,jwt_claims/1
+        ,refresh_expires_at/2
         ,jwt_iss/1
         ,maybe_keycloak_token/1
         ,maybe_keycloak_token_validate/2
@@ -32,6 +33,11 @@
         ,auth_source/2
         ,logout_url/0
         ,logout_url/1
+        ,logout_url/2
+        ,verify_logout_id_token/1
+        ,verify_backchannel_logout_token/1
+        ,validate_logout_id_claims/3
+        ,validate_backchannel_claims/4
         ,redact/1
         ,redact_headers/1
         ,redact_req_data/1
@@ -109,6 +115,8 @@
                              ,<<"kc_refresh_token">>
                              ,<<"kc_id_token">>
                              ,<<"id_token_hint">>
+                             ,<<"logout_token">>
+                             ,<<"verifier">>
                              ,<<"code">>
                              ,<<"code_verifier">>
                              ,<<"password">>
@@ -186,10 +194,6 @@
                               ,<<"cause">>
                               ]).
 
-%% Префикс секрета в логе и минимальная длина, при которой его вообще есть
-%% смысл печатать: 6 из >=24 байт — малая доля, 6 из 7 — весь секрет.
--define(REDACT_PREFIX_LEN, 6).
--define(REDACT_MIN_LEN_FOR_PREFIX, 24).
 
 -define(MK_USER,
         {[{<<"enabled">>, 'true'}
@@ -203,6 +207,10 @@
          ]}).
 
 -define(ISSUER_UNSET, <<"issuer">>).
+-define(BACKCHANNEL_LOGOUT_EVENT,
+        <<"http://schemas.openid.net/event/backchannel-logout">>).
+-define(ACCOUNT_ID_CLAIM, <<"account_id">>).
+-define(DEFAULT_ACCOUNT_ID_CLAIM, <<"default_account_id">>).
 
 %% @doc Дефолты самовосстановления oidcc discovery-воркера — см.
 %% `discovery_worker_opts/0'. `random_exponential' (а не `exponential') —
@@ -751,7 +759,7 @@ refresh_token(RefreshToken) ->
              ),
         %% Result содержит новый набор живых токенов (access/refresh/id) —
         %% сырой `~p' = 30-дневный replay при утечке логов (issue 01 KC-auth).
-        %% Логируем санитизированную структуру: префикс+длина вместо токенов.
+        %% Логируем санитизированную структуру: SHA-256 fingerprint вместо токенов.
         lager:info("zkeycloak refresh_token oidcc result: ~s", [redact_token_result(Result)]),
         case Result of
             {'ok', _} -> Result;
@@ -778,7 +786,7 @@ refresh_token(RefreshToken) ->
     end.
 
 %% @doc Маскирование bearer-кред (access/refresh/id token, code_verifier,
-%% authorization code) для лога. Печатаем только короткий префикс + длину —
+%% authorization code) для лога. Печатаем только короткий SHA-256 fingerprint —
 %% этого достаточно для корреляции лог-строк, но НЕ для реплея валидной
 %% сессии. Сырой токен в логах = 30-дневный replay при утечке лог-архива
 %% (issue 01 кросс-слойного KC-auth ревью). `lager'-вызов сохраняем —
@@ -797,20 +805,17 @@ refresh_token(RefreshToken) ->
 %% вместо badmatch-500), причём неаутентифицированным запросом. Секрет при
 %% этом всё равно не печатаем — на любой непечатаемой форме отдаём сентинел.
 %%
-%% Префикс печатается ТОЛЬКО у значений от ?REDACT_MIN_LEN_FOR_PREFIX байт:
-%% у короткого секрета `min(6, Len)' выдавал его целиком (`redact(<<"hunter2">>)'
-%% → `<<"hunter..(len=7)">>'). Для issue 01 это не стреляло — там только
-%% JWT/hex-креды в сотни байт, — но issue 15 завёл в ?SENSITIVE_BODY_KEYS
-%% `password', который короткий по природе. Ниже порога печатаем только длину.
+%% Для корреляции оставляем только первые 12 hex-символов SHA-256 и длину.
+%% Обратимые префиксы JWT/refresh/password не попадают в лог независимо от
+%% длины значения.
 -spec redact(any()) -> kz_term:ne_binary().
 redact('undefined') -> <<"undefined">>;
 redact(<<>>) -> <<"empty">>;
-redact(Value) when is_binary(Value), byte_size(Value) < ?REDACT_MIN_LEN_FOR_PREFIX ->
-    <<"redacted(len=", (integer_to_binary(byte_size(Value)))/binary, ")">>;
 redact(Value) when is_binary(Value) ->
-    Len = byte_size(Value),
-    Prefix = binary:part(Value, 0, ?REDACT_PREFIX_LEN),
-    <<Prefix/binary, "..(len=", (integer_to_binary(Len))/binary, ")">>;
+    Digest = kz_binary:hexencode(crypto:hash('sha256', Value)),
+    Fingerprint = binary:part(Digest, 0, 12),
+    <<"sha256:", Fingerprint/binary,
+      "(len=", (integer_to_binary(byte_size(Value)))/binary, ")">>;
 redact(Value) ->
     try redact(kz_term:to_binary(Value))
     catch
@@ -818,7 +823,7 @@ redact(Value) ->
     end.
 
 %% @doc Маскирование ПДн-значения (email/ФИО, эхнутые KC или валидатором).
-%% В отличие от `redact/1' префикс НЕ печатаем совсем, по двум причинам:
+%% В отличие от `redact/1' fingerprint не нужен: оставляем только длину, потому что
 %% (а) 6 байт email'а/ФИО — это всё ещё ПДн, корреляция по ним не нужна
 %% (для неё есть `owner_id'/`account_id'); (б) ФИО в UTF-8 (кириллица —
 %% 2 байта на символ), и побайтовый префикс режет символ пополам → в лог
@@ -840,7 +845,7 @@ redact_pii(Value) ->
 %% session-cookie — сырой `~p'-дамп `cb_context:req_headers/1' в лог = утечка
 %% (issue 14 кросс-слойного KC-auth ревью; тот же класс, что issue 01 про
 %% токены). Маскируем ТОЛЬКО значения sensitive-заголовков через `redact/1'
-%% (префикс+длина), имена и прочие заголовки оставляем как есть — лог
+%% (SHA-256 fingerprint), имена и прочие заголовки оставляем как есть — лог
 %% сохраняет диагностическую ценность. `lager'-вызовы НЕ удаляем: правило
 %% проекта — редактировать данные, не вырезать логи. Работает и с map
 %% (`cowboy:http_headers()' в этой версии Kazoo), и с proplist (историческая
@@ -886,8 +891,8 @@ redact_req_data(Value) ->
 %% @doc Рекурсивный key-wise редактор JSON-терма: значения ключей из `Keys'
 %% пропускаются через `Redactor', структура и остальные поля сохраняются.
 %% Параметризован, потому что мест применения два с РАЗНЫМИ доменами:
-%% тело запроса (креды → `redact/1', префикс+длина) и ошибки валидации
-%% (ПДн → `redact_pii/1', без префикса). См. `redact_req_data/1' и
+%% тело запроса (креды → `redact/1', SHA-256 fingerprint) и ошибки валидации
+%% (ПДн → `redact_pii/1', только длина). См. `redact_req_data/1' и
 %% `redact_validation_errors/1' (issue 15).
 -spec redact_json(kz_json:json_term()
                  ,[kz_term:ne_binary()]
@@ -1091,7 +1096,7 @@ redact_stack_frame(Frame) ->
 %%
 %% Сохраняем ТЕГ краша и полезную диагностику (имя клейма `Claim' — публичная
 %% схема, не ПДн), но вычищаем встроенное значение: binary → `redact/1'
-%% (префикс+длина, тот же класс секрета, что токены), любую другую форму
+%% (SHA-256 fingerprint, тот же класс секрета, что токены), любую другую форму
 %% (claims-map, token-record, JSON-объект, список) → непрозрачный сентинел
 %% `'$redacted''. Атомы без встроенного значения (`function_clause' — его
 %% аргументы живут ТОЛЬКО в стеке, а он редактируется отдельно; `badarg',
@@ -1147,7 +1152,7 @@ redact_reason({'invalid_property', {Field, GivenValue}}) ->
     %% refresh_token, id_token} `GivenValue' это СЫРОЙ токен-материал
     %% server-controlled формы (`:797/:809/:834'). `Field'
     %% (id_token/refresh_token/access_token/expires_in/scopes) — публичная
-    %% схема, оставляем; `GivenValue' режем по форме (binary → префикс+длина,
+    %% схема, оставляем; `GivenValue' режем по форме (binary → SHA-256 fingerprint,
     %% иначе сентинел) тем же редактором, что badmatch/none_alg_used.
     {'invalid_property', {Field, redact_reason_value(GivenValue)}};
 redact_reason({Class, Reason}) when Class =:= 'error';
@@ -1309,6 +1314,128 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
             {'error', Crash}
     end.
 
+%% @doc Verify an RP-initiated logout ID token without requiring it to be
+%% unexpired. OIDC permits a previously issued ID token as a logout hint, but
+%% signature and provider identity remain mandatory.
+-spec verify_logout_id_token(kz_term:ne_binary()) ->
+          {'ok', map()} | {'error', any()}.
+verify_logout_id_token(Token) ->
+    try kz_auth_jwt:token_for_logout(Token) of
+        #{'verify_result' := 'true', 'payload' := Claims} when is_map(Claims) ->
+            validate_logout_id_claims(Claims, issuer(), client_id());
+        _ -> {'error', 'logout_token_verify_failed'}
+    catch
+        _:_ -> {'error', 'logout_token_invalid'}
+    end.
+
+%% @doc Verify signature/expiry first, then enforce Back-Channel Logout 1.0
+%% event constraints. The returned tuple contains only non-secret correlation
+%% fields required by the authoritative storage layer.
+-spec verify_backchannel_logout_token(kz_term:ne_binary()) ->
+          {'ok', map()} | {'error', any()}.
+verify_backchannel_logout_token(Token) ->
+    case decode_safe(Token, 'true') of
+        {'ok', _Header, ClaimsList} ->
+            validate_backchannel_claims(
+              maps:from_list(ClaimsList), issuer(), client_id(), kz_time:current_unix_tstamp());
+        {'error', _} -> {'error', 'logout_token_verify_failed'}
+    end.
+
+-spec validate_logout_id_claims(map(), kz_term:ne_binary(),
+                                kz_term:ne_binary()) ->
+          {'ok', map()} | {'error', any()}.
+validate_logout_id_claims(Claims, ExpectedIssuer, ClientId) ->
+    case validate_logout_provider(Claims, ExpectedIssuer, ClientId) of
+        'ok' -> validate_logout_identity(Claims);
+        {'error', _}=Error -> Error
+    end.
+
+-spec validate_logout_identity(map()) -> {'ok', map()} | {'error', any()}.
+validate_logout_identity(Claims) ->
+    Sid = maps:get(<<"sid">>, Claims,
+                   maps:get(<<"session_state">>, Claims, 'undefined')),
+    Sub = maps:get(<<"sub">>, Claims, 'undefined'),
+    AccountId = logout_account_id(Claims),
+    case {is_ne_binary(Sid), is_ne_binary(Sub), is_raw_account_id(AccountId)} of
+        {'true', 'true', 'true'} ->
+            {'ok', #{'sid' => Sid, 'sub' => Sub, 'account_id' => AccountId}};
+        {'false', _, _} -> {'error', 'logout_token_sid_missing'};
+        {_, 'false', _} -> {'error', 'logout_token_sub_missing'};
+        _ -> {'error', 'logout_token_account_invalid'}
+    end.
+
+-spec logout_account_id(map()) -> any().
+logout_account_id(Claims) ->
+    case maps:get(?ACCOUNT_ID_CLAIM, Claims, 'undefined') of
+        Absent when Absent =:= 'undefined'; Absent =:= 'null' ->
+            maps:get(?DEFAULT_ACCOUNT_ID_CLAIM, Claims, 'undefined');
+        AccountId -> AccountId
+    end.
+
+-spec validate_backchannel_claims(map(), kz_term:ne_binary(),
+                                  kz_term:ne_binary(), integer()) ->
+          {'ok', map()} | {'error', any()}.
+validate_backchannel_claims(Claims, ExpectedIssuer, ClientId, Now) ->
+    case validate_logout_provider(Claims, ExpectedIssuer, ClientId) of
+        'ok' -> validate_logout_event(Claims, Now);
+        {'error', _}=Error -> Error
+    end.
+
+-spec validate_logout_provider(map(), kz_term:ne_binary(),
+                               kz_term:ne_binary()) ->
+          'ok' | {'error', any()}.
+validate_logout_provider(Claims, ExpectedIssuer, ClientId) ->
+    case maps:get(<<"iss">>, Claims, 'undefined') =:= ExpectedIssuer of
+        'false' -> {'error', 'logout_token_bad_issuer'};
+        'true' ->
+            case audience_contains(maps:get(<<"aud">>, Claims, 'undefined'),
+                                   ClientId) of
+                'true' -> 'ok';
+                'false' -> {'error', 'logout_token_bad_audience'}
+            end
+    end.
+
+-spec audience_contains(any(), kz_term:ne_binary()) -> boolean().
+audience_contains(ClientId, ClientId) -> 'true';
+audience_contains(Audiences, ClientId) when is_list(Audiences) ->
+    lists:member(ClientId, Audiences);
+audience_contains(_Audience, _ClientId) -> 'false'.
+
+-spec validate_logout_event(map(), integer()) ->
+          {'ok', map()} | {'error', any()}.
+validate_logout_event(Claims, Now) ->
+    Events = maps:get(<<"events">>, Claims, #{}),
+    HasEvent = is_map(Events) andalso maps:is_key(?BACKCHANNEL_LOGOUT_EVENT, Events),
+    HasNonce = maps:is_key(<<"nonce">>, Claims),
+    Sid = maps:get(<<"sid">>, Claims, 'undefined'),
+    Jti = maps:get(<<"jti">>, Claims, 'undefined'),
+    IssuedAt = maps:get(<<"iat">>, Claims, 'undefined'),
+    ExpiresAt = maps:get(<<"exp">>, Claims, 'undefined'),
+    validate_logout_event_fields(
+      HasEvent, HasNonce, Sid, Jti, IssuedAt, ExpiresAt, Now).
+
+-spec validate_logout_event_fields(boolean(), boolean(), any(), any(), any(),
+                                   any(), integer()) ->
+          {'ok', map()} | {'error', any()}.
+validate_logout_event_fields('false', _HasNonce, _Sid, _Jti, _Iat, _Exp, _Now) ->
+    {'error', 'logout_event_missing'};
+validate_logout_event_fields('true', 'true', _Sid, _Jti, _Iat, _Exp, _Now) ->
+    {'error', 'logout_event_nonce_forbidden'};
+validate_logout_event_fields('true', 'false', Sid, Jti, Iat, Exp, Now)
+  when is_binary(Sid), byte_size(Sid) > 0,
+       is_binary(Jti), byte_size(Jti) > 0,
+       is_integer(Iat), Iat =< Now + 60,
+       is_integer(Exp), Exp > Now ->
+    {'ok', #{'sid' => Sid, 'jti' => Jti, 'expires_at' => Exp}};
+validate_logout_event_fields('true', 'false', _Sid, _Jti, _Iat, Exp, Now)
+  when not is_integer(Exp); Exp =< Now ->
+    {'error', 'logout_event_expired'};
+validate_logout_event_fields('true', 'false', _Sid, _Jti, _Iat, _Exp, _Now) ->
+    {'error', 'logout_event_invalid'}.
+
+-spec is_ne_binary(any()) -> boolean().
+is_ne_binary(Value) -> is_binary(Value) andalso byte_size(Value) > 0.
+
 -spec jwt_claims(kz_term:ne_binary()) -> kz_term:proplist().
 jwt_claims(Token) ->
     %% Верифицированные claims; на истёкшем/невалидном токене — пустой список.
@@ -1356,6 +1483,37 @@ jwt_sub_unverified(Token) ->
     Bin = base64:decode(Padded, #{'mode' => 'urlsafe'}),
     Claims = kz_json:decode(Bin),
     kz_json:get_ne_binary_value(<<"sub">>, Claims).
+%% @doc Retention boundary for a refresh credential returned by Keycloak.
+%% The token response is already trusted at this point; this parse is used only
+%% to extend cleanup retention and never to authenticate a caller.
+-spec refresh_expires_at(kz_term:ne_binary(), any()) -> any().
+refresh_expires_at(Token, Fallback) ->
+    FallbackExpiry = case Fallback of
+                         Value when is_integer(Value), Value > 0 -> Value;
+                         _ -> 0
+                     end,
+    try
+        Payload = case binary:split(Token, <<".">>, ['global']) of
+                      [_Header, P, _Signature] -> P;
+                      _ -> error('malformed_jwt')
+                  end,
+        Padded = case byte_size(Payload) rem 4 of
+                     0 -> Payload;
+                     2 -> <<Payload/binary, "==">>;
+                     3 -> <<Payload/binary, "=">>;
+                     _ -> error('malformed_jwt')
+                 end,
+        Claims = kz_json:decode(
+                   base64:decode(Padded, #{'mode' => 'urlsafe'})),
+        Exp = kz_json:get_integer_value(<<"exp">>, Claims, FallbackExpiry),
+        case erlang:max(Exp, FallbackExpiry) of
+            0 -> Fallback;
+            RetainUntil -> RetainUntil
+        end
+    catch
+        _:_ -> Fallback
+    end.
+
 
 -spec jwt_iss(kz_term:ne_binary()) -> kz_term:api_ne_binary().
 jwt_iss(Token) ->
@@ -1623,6 +1781,10 @@ logout_url() ->
 %% silent end_session — без него KC показывает confirmation page.
 -spec logout_url(kz_term:api_ne_binary()) -> kz_term:ne_binary().
 logout_url(IdTokenHint) ->
+    logout_url(IdTokenHint, 'undefined').
+
+-spec logout_url(kz_term:api_ne_binary(), kz_term:api_ne_binary()) -> kz_term:ne_binary().
+logout_url(IdTokenHint, State) ->
     Issuer = issuer(),
     ClientId = client_id(),
     RedirectUri = redirect_uri(),
@@ -1630,10 +1792,15 @@ logout_url(IdTokenHint) ->
     BaseParams = [{<<"client_id">>, ClientId}
                  ,{<<"post_logout_redirect_uri">>, RedirectUri}
                  ],
-    Params = case IdTokenHint of
-                 'undefined' -> BaseParams;
-                 <<>> -> BaseParams;
-                 Hint -> [{<<"id_token_hint">>, Hint} | BaseParams]
+    HintParams = case IdTokenHint of
+                     'undefined' -> BaseParams;
+                     <<>> -> BaseParams;
+                     Hint -> [{<<"id_token_hint">>, Hint} | BaseParams]
+                 end,
+    Params = case State of
+                 'undefined' -> HintParams;
+                 <<>> -> HintParams;
+                 _ -> [{<<"state">>, State} | HintParams]
              end,
     QS = uri_string:compose_query(Params),
     <<EndSession/binary, "?", QS/binary>>.
