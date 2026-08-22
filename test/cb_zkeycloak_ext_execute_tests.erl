@@ -43,7 +43,7 @@
 -define(LOGOUT_URL, <<"https://keycloak.example/realms/BRT/protocol/openid-connect/logout">>).
 
 -define(MOCKED, ['zkeycloak_util', 'kz_datamgr', 'crossbar_auth', 'api_util',
-                 'kz_auth_session_family']).
+                 'kz_auth_session_family', 'cb_modules_util']).
 
 execute_contract_test_() ->
     {'foreach'
@@ -66,6 +66,8 @@ execute_contract_test_() ->
      ,fun execute_logout_ack_unconfirmed_is_409_/1
      ,fun execute_refresh_invalid_grant_maps_to_401_/1
      ,fun execute_logout_keeps_url_envelope_/1
+     ,fun logout_start_is_rate_limited_/1
+     ,fun logout_start_limiter_failure_passes_through_/1
      ,fun execute_root_path_keeps_envelope_/1
      ,fun execute_non_mutating_unknown_path_applies_nothing_/1
      ]
@@ -267,6 +269,50 @@ execute_logout_keeps_url_envelope_(_) ->
     ,?_assertEqual(?LOGOUT_URL, kz_json:get_value(<<"logout_url">>, Resp))
     ,?_assertEqual(<<"state-1">>, kz_json:get_value(<<"state">>, Resp))
     ,?_assertEqual(<<"verifier-1">>, kz_json:get_value(<<"verifier">>, Resp))
+    ].
+
+%%%=============================================================================
+%%% Крышка частоты на НЕаутентифицированном старте logout (находка 01-P3-4)
+%%%
+%%% `POST /zkeycloak_ext/logout' проходит `authenticate'/`authorize' как
+%%% `true' и СОЗДАЁТ transaction-док на каждый вызов (случайный `state').
+%%% Общий rate-limit `cb_token_auth' сюда не достаёт: он висит на
+%%% `x-auth-token'/`bearer', которых у этой ручки нет.
+%%%=============================================================================
+
+logout_start_is_rate_limited_(_) ->
+    meck:expect('cb_modules_util', 'consume_tokens_until',
+                fun(Ctx, _Cost) -> {'false', Ctx} end),
+    Validated = cb_zkeycloak_ext:validate(logout_ctx(), ?LOGOUT),
+    Result = cb_zkeycloak_ext:post(preset_fatal(Validated), ?LOGOUT),
+    [{"исчерпанный бакет = 429, а не создание дока"
+     ,?_assertEqual(429, cb_context:resp_error_code(Validated))
+     }
+     %% Крышка стоит ДО криптопроверки: иначе поток невалидных токенов гонял
+     %% бы верификацию подписи без ограничителя вовсе.
+    ,{"подпись при отказе даже не проверяется"
+     ,?_assertEqual(0, meck:num_calls('zkeycloak_util', 'verify_logout_id_token', '_'))
+     }
+    ,{"transaction-док не создаётся ни в validate, ни в post"
+     ,?_assertEqual(0, meck:num_calls('kz_auth_session_family', 'begin_logout', '_'))
+     }
+    ,{"конверт отказа доезжает до post без успеха"
+     ,?_assertNotEqual('success', cb_context:resp_status(Result))
+     }
+    ].
+
+logout_start_limiter_failure_passes_through_(_) ->
+    %% Гейт в РАБОЧЕМ пути обязан быть fail-open: недоступный `kz_buckets' не
+    %% имеет права запирать выход. Отказ ограничителя при этом счётен
+    %% (`lager:warning'), а не молчалив.
+    meck:expect('cb_modules_util', 'consume_tokens_until',
+                fun(_Ctx, _Cost) -> error('bucket_server_down') end),
+    Validated = cb_zkeycloak_ext:validate(logout_ctx(), ?LOGOUT),
+    Result = cb_zkeycloak_ext:post(preset_fatal(Validated), ?LOGOUT),
+    [?_assertEqual('success', cb_context:resp_status(Validated))
+    ,?_assertEqual('success', cb_context:resp_status(Result))
+    ,?_assertEqual(?LOGOUT_URL,
+                   kz_json:get_value(<<"logout_url">>, cb_context:resp_data(Result)))
     ].
 
 execute_backchannel_revokes_sid_(_) ->

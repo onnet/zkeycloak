@@ -61,6 +61,30 @@
 -define(SESSION_CONTEXT, 'zkeycloak_session_context').
 
 -define(LOGOUT_TRANSACTION_TTL_S, 300).
+
+%% @doc Стоимость старта logout в token-bucket'е клиента (находка 01-P3-4
+%% кросс-ревью 22.08.2026).
+%%
+%% `POST /zkeycloak_ext/logout' — НЕаутентифицированная ручка
+%% (`authenticate_nouns'/`authorize_nouns' отдают `true'), и она СОЗДАЁТ
+%% документ: `begin_logout/4' пишет transaction-док со случайным `state', то
+%% есть каждый вызов — новый док в `token_auth' (TTL 300 с). Требование
+%% валидной подписи `id_token' сужает круг до инсайдеров и утёкших токенов,
+%% но НЕ ограничивает частоту: один валидный (в т.ч. ИСТЁКШИЙ —
+%% `verify_logout_id_token/1' срок не смотрит намеренно) `id_token' даёт
+%% неограниченную запись в прод-базу. Общий rate-limit `cb_token_auth' этот
+%% путь не покрывает: он висит на `x-auth-token'/`bearer', которых здесь нет.
+%%
+%% Механика — та же, что у соседней неаутентифицированной ручки, создающей
+%% состояние (`cb_user_auth:validate/1'): счёт по бакету клиента
+%% (IP + account_id), цена из конфига, отказ = 429. Дефолт равен
+%% `user_auth_tokens' — логин и выход одного пользователя это события одного
+%% порядка частоты; занижать нельзя (клиент трёхшагового logout зовёт ручку
+%% штатно).
+-define(DEFAULT_LOGOUT_START_TOKENS, 35).
+-define(LOGOUT_START_TOKENS,
+        kapps_config:get_integer(?CONFIG_CAT, <<"zkeycloak_logout_tokens">>
+                                ,?DEFAULT_LOGOUT_START_TOKENS)).
 -spec init() -> ok.
 init() ->
     _ = crossbar_bindings:bind(<<"*.authenticate.zkeycloak_ext">>, ?MODULE, 'authenticate'),
@@ -469,6 +493,49 @@ post(Context, _Token1, _Token2) ->
 %% validate; Crossbar execute owns all mutations.
 -spec validate_logout_start(cb_context:context()) -> cb_context:context().
 validate_logout_start(Context) ->
+    %% Крышка ПЕРЕД проверкой подписи: иначе счётчик тратился бы только на
+    %% валидные токены, а поток невалидных гонял бы криптопроверку без
+    %% ограничителя. См. ?LOGOUT_START_TOKENS.
+    case logout_start_rate_limit(Context) of
+        {'false', Context1} ->
+            lager:warning("rate limiting keycloak logout start for ~s",
+                          [cb_context:client_ip(Context1)]),
+            cb_context:add_system_error('too_many_requests', Context1);
+        {'true', Context1} -> validate_logout_start_verified(Context1)
+    end.
+
+%%------------------------------------------------------------------------------
+%% @doc Крышка частоты на старте logout — FAIL-OPEN по построению.
+%%
+%% Ограничитель ДОБАВЛЕН поверх работавшего пути, и его собственный отказ
+%% (нет `kz_buckets', недоступен `kapps_config') не имеет права запирать
+%% выход: гейт в рабочем пути, падающий закрыто, превращает деградацию
+%% инфраструктуры в отказ функции. Отказ ограничителя счётен по
+%% `lager:warning' — то есть виден, а не молчалив.
+%% @end
+%%------------------------------------------------------------------------------
+-spec logout_start_rate_limit(cb_context:context()) ->
+          {boolean(), cb_context:context()}.
+logout_start_rate_limit(Context) ->
+    try cb_modules_util:consume_tokens_until(Context, logout_start_cost(Context))
+    catch
+        _E:_R ->
+            lager:warning("keycloak logout rate limiter unavailable (~p:~p): passing through",
+                          [_E, _R]),
+            {'true', Context}
+    end.
+
+%% Цена читается ОТДЕЛЬНО и тоже тотально: недоступный `kapps_config' обязан
+%% давать код-дефолт, а не снимать крышку целиком (иначе отказ конфига
+%% выключал бы ограничитель, а не только его настройку).
+-spec logout_start_cost(cb_context:context()) -> non_neg_integer().
+logout_start_cost(Context) ->
+    try cb_modules_util:token_cost(Context, ?LOGOUT_START_TOKENS)
+    catch _E:_R -> ?DEFAULT_LOGOUT_START_TOKENS
+    end.
+
+-spec validate_logout_start_verified(cb_context:context()) -> cb_context:context().
+validate_logout_start_verified(Context) ->
     IdTokenHint = logout_id_token_hint(Context),
     case IdTokenHint of
         'undefined' -> cb_context:add_system_error('invalid_credentials', Context);
