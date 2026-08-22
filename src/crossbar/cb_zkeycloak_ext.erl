@@ -1223,10 +1223,17 @@ prepare_keycloak_session(Context, AccountId, OwnerId, TokenRefresh) ->
     case cb_context:fetch(Context, ?SESSION_CONTEXT) of
         'undefined' -> {'ok', Context};
         {'error', Reason} -> {'error', Reason};
+        %% `'login'' — не косметика: этой меткой бэкенд отличает ПОЛНОЦЕННЫЙ
+        %% вход (свежая верификация authorization code/токена KC) от продления
+        %% по refresh-токену. Только на ней `kz_auth_session_family' имеет право
+        %% перевязать живой sid-binding на новую family, когда старую отозвал
+        %% kazoo-only logout (решение владельца 22.08.2026 по F3A-P1-1,
+        %% вариант «а»). Refresh-ветки ниже зовут арность без метки и остаются
+        %% с прежним `session_revoked'.
         {'login', Sid, ExpiresAt} ->
             bind_session_result(Context, Sid,
               kz_auth_session_family:create_keycloak_session(
-                AccountId, OwnerId, Sid, TokenRefresh, ExpiresAt));
+                AccountId, OwnerId, Sid, TokenRefresh, ExpiresAt, 'login'));
         {'refresh', 'legacy', Sid, ExpiresAt} ->
             bind_session_result(Context, Sid,
               kz_auth_session_family:create_keycloak_session(
