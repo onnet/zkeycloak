@@ -177,6 +177,68 @@ redact_req_data_masks_password_and_code_test() ->
     ?assertEqual('nomatch', binary:match(Fmt, <<"oidc-code-abcdef">>)),
     ?assertEqual('nomatch', binary:match(Fmt, <<"pkce-verifier-xyz">>)).
 
+%%%-----------------------------------------------------------------------------
+%%% Низкоэнтропийные секреты маскируются ДЛИНОЙ, а не отпечатком
+%%% (находка 01-P2-2 кросс-ревью 22.08.2026)
+%%%
+%%% `redact/1' печатает 12 hex несолёного SHA-256 = 48 бит. Для токена это
+%%% безопасно, для ПАРОЛЯ — нет: обладатель лог-архива считает
+%%% `sha256(кандидат)' офлайн и сравнивает префикс, а `lager:info' виден на
+%%% проде. Утверждение формулируется ИСПОЛНЯЕМО: по лог-строке пароль из
+%%% словаря обязан быть НЕ восстановим тем самым вычислением, которым его
+%%% восстанавливали.
+%%%-----------------------------------------------------------------------------
+
+redact_req_data_password_is_not_a_dictionary_oracle_test() ->
+    Password = <<"hunter2">>,
+    Body = kz_json:from_list([{<<"password">>, Password}]),
+    Fmt = ?FMT(zkeycloak_util:redact_req_data(Body)),
+    %% сам пароль в логе не лежит
+    ?assertEqual('nomatch', binary:match(Fmt, Password)),
+    %% и его отпечаток — тоже: иначе словарный перебор по логу тривиален
+    ?assertEqual('nomatch', binary:match(Fmt, fingerprint(Password))),
+    ?assertEqual('nomatch', binary:match(Fmt, <<"sha256:">>)).
+
+redact_req_data_client_secret_is_length_only_test() ->
+    Secret = <<"onbill-client-secret">>,
+    Body = kz_json:from_list([{<<"client_secret">>, Secret}]),
+    Fmt = ?FMT(zkeycloak_util:redact_req_data(Body)),
+    ?assertEqual('nomatch', binary:match(Fmt, Secret)),
+    ?assertEqual('nomatch', binary:match(Fmt, fingerprint(Secret))).
+
+redact_req_data_high_entropy_keeps_its_fingerprint_test() ->
+    %% Позитивный контроль: разделение по энтропии не имеет права выродиться
+    %% в «всем длину» — корреляция «тот же токен?» по логу должна остаться.
+    Body = kz_json:from_list([{<<"refresh_token">>, ?REFRESH}
+                             ,{<<"password">>, <<"hunter2">>}
+                             ]),
+    R = zkeycloak_util:redact_req_data(Body),
+    ?assertMatch(<<"sha256:", _/binary>>,
+                 kz_json:get_value(<<"refresh_token">>, R)),
+    ?assertMatch(<<"redacted(len=", _/binary>>,
+                 kz_json:get_value(<<"password">>, R)).
+
+redact_req_data_password_under_envelope_test() ->
+    %% Тот же класс вторым уровнем — форма, которой ходит `brt-unified'.
+    ReqJSON = kz_json:from_list(
+                [{<<"data">>, kz_json:from_list([{<<"password">>, <<"hunter2">>}])}]),
+    Fmt = ?FMT(zkeycloak_util:redact_req_data(ReqJSON)),
+    ?assertEqual('nomatch', binary:match(Fmt, fingerprint(<<"hunter2">>))).
+
+redact_low_entropy_is_total_test() ->
+    %% Домен тот же, что у `redact/1': форму значения диктует КЛИЕНТ, и
+    %% `authorize/1' отрабатывает до аутентификации. Частичный редактор ронял
+    %% бы запрос в 500 — ровно тот класс, что закрывали issue 05/07/10.
+    Body = kz_json:from_list([{<<"password">>, [kz_json:from_list([{<<"x">>,1}])]}]),
+    ?assertEqual(<<"redacted(unprintable)">>
+                ,kz_json:get_value(<<"password">>, zkeycloak_util:redact_req_data(Body))),
+    Empty = kz_json:from_list([{<<"password">>, <<>>}]),
+    ?assertEqual(<<"empty">>
+                ,kz_json:get_value(<<"password">>, zkeycloak_util:redact_req_data(Empty))).
+
+fingerprint(Value) ->
+    binary:part(kz_binary:hexencode(crypto:hash('sha256', Value)), 0, 12).
+
 redact_req_data_preserves_non_sensitive_test() ->
     %% Лог обязан остаться диагностически полезным.
     Body = kz_json:from_list([{<<"refresh_token">>, ?REFRESH}

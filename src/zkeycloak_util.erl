@@ -126,6 +126,35 @@
                              ,<<"auth_token">>
                              ]).
 
+%% @doc Подмножество ?SENSITIVE_BODY_KEYS, значения которых НИЗКОЭНТРОПИЙНЫ:
+%% маскируются длиной, а не отпечатком (находка 01-P2-2 кросс-ревью
+%% 22.08.2026).
+%%
+%% ⚠️ Разделение не по «секрет / не секрет», а по ЭНТРОПИИ, и это не
+%% педантизм. `redact/1' печатает первые 12 hex несолёного SHA-256 — 48 бит
+%% отпечатка. Для JWT, refresh- и id_token'ов (issue 01/15) это безопасно:
+%% пространство значений криптографическое, перебор невозможен. Для ПАРОЛЯ
+%% пространство словарное: обладатель лог-архива офлайн считает
+%% `sha256(кандидат)' и сравнивает первые 12 hex — словарный пароль
+%% восстанавливается тривиально, и `lager:info' с таким отпечатком виден на
+%% проде. То есть fingerprint пароля — это не маскировка, а хеш пароля в
+%% открытом логе.
+%%
+%% Прежняя редакция закрывала ровно этот класс гардом
+%% `?REDACT_MIN_LEN_FOR_PREFIX' («короткое значение печатаем длиной») — гард
+%% сняли вместе с префиксом, а класс остался: длина значения не определяет
+%% его энтропию (`hunter2' и 8-байтовый фрагмент токена неотличимы по длине).
+%% Признак — ИМЯ КЛЮЧА, потому что энтропия есть свойство того, кто значение
+%% порождает: пароль выбирает человек, токен выпускает KC.
+%%
+%% `client_secret' здесь же: в realm'е его обычно генерирует KC, но
+%% оператор вправе задать свой, и «обычно» — не свойство кода.
+%% `code_verifier' в список НЕ входит: PKCE требует ≥ 43 символов
+%% криптослучайности, это генерирует клиент по спецификации.
+-define(LOW_ENTROPY_BODY_KEYS, [<<"password">>
+                               ,<<"client_secret">>
+                               ]).
+
 %% @doc Claim'ы KC (id_token / userinfo), значения которых МОЖНО писать в
 %% лог: служебные поля OIDC-флоу и гейтов этого модуля, к ПДн не относящиеся.
 %%
@@ -886,17 +915,54 @@ redact_header_kv(Key, Value) ->
 -spec redact_req_data(kz_json:object() | kz_json:json_term()) ->
           kz_json:object() | kz_json:json_term().
 redact_req_data(Value) ->
-    redact_json(Value, ?SENSITIVE_BODY_KEYS, fun redact/1).
+    redact_json(Value, ?SENSITIVE_BODY_KEYS, fun redact_body_value/2).
+
+%% @doc Класс маскирования значения тела выбирается ПО ИМЕНИ КЛЮЧА.
+%%
+%% Высокоэнтропийные креды (токены, коды, verifier) получают отпечаток — он
+%% даёт корреляцию «тот же токен?» и необратим. Низкоэнтропийные
+%% (?LOW_ENTROPY_BODY_KEYS — пароль, client_secret) получают только длину:
+%% несолёный отпечаток словарного значения перебирается по логу офлайн, см.
+%% разбор у ?LOW_ENTROPY_BODY_KEYS.
+-spec redact_body_value(kz_json:key(), any()) -> kz_term:ne_binary().
+redact_body_value(Key, Value) ->
+    case is_sensitive_key(Key, ?LOW_ENTROPY_BODY_KEYS) of
+        'true' -> redact_low_entropy(Value);
+        'false' -> redact(Value)
+    end.
+
+%% @doc Маскирование НИЗКОЭНТРОПИЙНОГО секрета: только факт и длина.
+%%
+%% Форма совпадает с `redact_pii/1' намеренно (лог читается одним глазом), но
+%% функция отдельная: у неё другое основание. У ПДн длину печатают потому,
+%% что префикс ПДн — это всё ещё ПДн; здесь — потому что ОТПЕЧАТОК
+%% низкоэнтропийного значения обратим перебором. Слить их в одну значило бы
+%% потерять причину, по которой класс нельзя вернуть к `redact/1'.
+-spec redact_low_entropy(any()) -> kz_term:ne_binary().
+redact_low_entropy('undefined') -> <<"undefined">>;
+redact_low_entropy(<<>>) -> <<"empty">>;
+redact_low_entropy(Value) when is_binary(Value) ->
+    <<"redacted(len=", (integer_to_binary(byte_size(Value)))/binary, ")">>;
+redact_low_entropy(Value) ->
+    try redact_low_entropy(kz_term:to_binary(Value))
+    catch
+        _Class:_Reason -> <<"redacted(unprintable)">>
+    end.
 
 %% @doc Рекурсивный key-wise редактор JSON-терма: значения ключей из `Keys'
 %% пропускаются через `Redactor', структура и остальные поля сохраняются.
 %% Параметризован, потому что мест применения два с РАЗНЫМИ доменами:
-%% тело запроса (креды → `redact/1', SHA-256 fingerprint) и ошибки валидации
-%% (ПДн → `redact_pii/1', только длина). См. `redact_req_data/1' и
-%% `redact_validation_errors/1' (issue 15).
+%% тело запроса (креды) и ошибки валидации (ПДн → `redact_pii/1', только
+%% длина). См. `redact_req_data/1' и `redact_validation_errors/1' (issue 15).
+%%
+%% Редактор принимает КЛЮЧ вместе со значением (находка 01-P2-2 кросс-ревью
+%% 22.08.2026): внутри одного домена класс маскирования бывает разным —
+%% отпечаток для высокоэнтропийных кредов и длина для низкоэнтропийных
+%% (`redact_body_value/2'). Без ключа выбрать класс не на чем, и всему телу
+%% доставался один редактор — тот, что для пароля обратим перебором.
 -spec redact_json(kz_json:json_term()
                  ,[kz_term:ne_binary()]
-                 ,fun((any()) -> kz_term:ne_binary())
+                 ,fun((kz_json:key(), any()) -> kz_term:ne_binary())
                  ) -> kz_json:json_term().
 redact_json(Value, Keys, Redactor) ->
     case kz_json:is_json_object(Value) of
@@ -909,11 +975,11 @@ redact_json(Value, Keys, Redactor) ->
 -spec redact_json_kv(kz_json:key()
                     ,kz_json:json_term()
                     ,[kz_term:ne_binary()]
-                    ,fun((any()) -> kz_term:ne_binary())
+                    ,fun((kz_json:key(), any()) -> kz_term:ne_binary())
                     ) -> {kz_json:key(), kz_json:json_term()}.
 redact_json_kv(Key, Value, Keys, Redactor) ->
     case is_sensitive_key(Key, Keys) of
-        'true' -> {Key, Redactor(Value)};
+        'true' -> {Key, Redactor(Key, Value)};
         'false' -> {Key, redact_json(Value, Keys, Redactor)}
     end.
 
@@ -922,7 +988,7 @@ redact_json_kv(Key, Value, Keys, Redactor) ->
 %% сюда не попадает — он tuple (`?JSON_WRAPPER'), его снял `is_json_object/1'.
 -spec redact_json_term(kz_json:json_term()
                       ,[kz_term:ne_binary()]
-                      ,fun((any()) -> kz_term:ne_binary())
+                      ,fun((kz_json:key(), any()) -> kz_term:ne_binary())
                       ) -> kz_json:json_term().
 redact_json_term(Values, Keys, Redactor) when is_list(Values) ->
     [redact_json(V, Keys, Redactor) || V <- Values];
@@ -1043,7 +1109,8 @@ redact_validation_errors(Other) ->
 
 -spec redact_validation_error(any()) -> any().
 redact_validation_error({Path, Code, Msg}) ->
-    {Path, Code, redact_json(Msg, ?SENSITIVE_ERROR_KEYS, fun redact_pii/1)};
+    {Path, Code, redact_json(Msg, ?SENSITIVE_ERROR_KEYS,
+                            fun(_Key, V) -> redact_pii(V) end)};
 redact_validation_error(Other) ->
     Other.
 
