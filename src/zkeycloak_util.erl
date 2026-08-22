@@ -279,9 +279,20 @@
 %% конфига он был бы взведённым ружьём.
 -define(ALLOWED_BACKOFF_TYPES, ['exponential', 'random', 'random_exponential']).
 
+%% @doc Issuer нашего KC в КАНОНИЧЕСКОЙ форме (находка F3A-P3-2 кросс-ревью
+%% 22.08.2026). Канонизация живёт в core (`kz_auth_issuer'), потому что второй
+%% её потребитель — `kz_auth_gate' — не имеет права зависеть от beam'а
+%% zkeycloak; здесь остаётся только прикладной дефолт-сентинел.
+%%
+%% Канонична не только сверка: из этого значения строится и `logout_url/2'
+%% (`<<Issuer/binary, "/protocol/openid-connect/logout">>'), и `issuer'
+%% oidcc-воркера дискавери (`zkeycloak_oidcc_sup:worker_opts/0'), где KC
+%% дописывает `/.well-known/openid-configuration'. Конфиг с хвостовым слэшем
+%% давал обоим путям двойной слэш в URL — тот же корень, третий и четвёртый
+%% симптомы.
 -spec issuer() -> kz_term:ne_binary().
 issuer() ->
-    kapps_config:get_ne_binary(<<"zkeycloak">>, <<"issuer">>, ?ISSUER_UNSET).
+    kz_auth_issuer:keycloak(?ISSUER_UNSET).
 
 -spec client_id_atom() -> atom().
 client_id_atom() ->
@@ -1448,11 +1459,20 @@ validate_backchannel_claims(Claims, ExpectedIssuer, ClientId, Now) ->
         {'error', _}=Error -> Error
     end.
 
+%% Сверка issuer'а — по КАНОНИЧЕСКОЙ форме обеих сторон (F3A-P3-2). Побайтовое
+%% сравнение отвергало токен НАШЕГО KC, если `zkeycloak.issuer' записан с
+%% хвостовым слэшем, явным `:443' или в другом регистре хоста: старт logout
+%% отдавал 401, а backchannel-токен — `logout_token_bad_issuer', из-за чего
+%% sid-binding никогда не доходил до `op_revoked' и клиент получал вечный 409.
+%% Разные realm/хост/схема канонизацией НЕ сближаются — гард foreign issuer жив.
 -spec validate_logout_provider(map(), kz_term:ne_binary(),
                                kz_term:ne_binary()) ->
           'ok' | {'error', any()}.
 validate_logout_provider(Claims, ExpectedIssuer, ClientId) ->
-    case maps:get(<<"iss">>, Claims, 'undefined') =:= ExpectedIssuer of
+    case kz_auth_issuer:equals(maps:get(<<"iss">>, Claims, 'undefined')
+                              ,ExpectedIssuer
+                              )
+    of
         'false' -> {'error', 'logout_token_bad_issuer'};
         'true' ->
             case audience_contains(maps:get(<<"aud">>, Claims, 'undefined'),
@@ -1597,10 +1617,14 @@ jwt_iss(Token) ->
 %% KC-токен как «не-KC» и пропускала его в общий `kz_auth' мимо
 %% роль-гейта `onbill_access' (fail-open; Fable-review issue 12).
 %% Дефолт-сентинел `?ISSUER_UNSET' с реальным `iss' (URL) не совпадёт.
+%%
+%% Сверка — по канонической форме (`kz_auth_issuer:equals/2', F3A-P3-2): иначе
+%% неканонично записанный `zkeycloak.issuer' делал бы токен НАШЕГО KC «чужим»,
+%% т.е. пропускал бы его в общий `kz_auth' мимо роль-гейта `onbill_access'.
 -spec maybe_keycloak_token(kz_term:ne_binary()) -> boolean().
 maybe_keycloak_token(Token) ->
     is_jwt_shaped(Token)
-        andalso jwt_iss(Token) == issuer().
+        andalso kz_auth_issuer:equals(jwt_iss(Token), issuer()).
 
 %% @doc Дешёвый предчек: JWT = `header.payload.sig' (минимум две точки).
 %% Opaque Kazoo db-токены (UUID) точек не содержат → пропускаем дорогой

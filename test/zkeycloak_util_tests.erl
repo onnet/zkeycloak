@@ -1195,6 +1195,110 @@ logout_claim_validation_test_() ->
           ?LOGOUT_ISSUER, ?LOGOUT_CLIENT, Now))
     ].
 
+%%%=============================================================================
+%%% F3A-P3-2 (кросс-ревью 22.08): issuer сверяется по КАНОНИЧЕСКОЙ форме
+%%% (RFC 3986 §6.2.2–6.2.3), а не побайтово.
+%%%
+%%% Класс расхождений «та же сущность, другая запись» — хвостовой слэш, явный
+%%% дефолтный порт, регистр схемы/хоста — клиентский гард zfield
+%%% (`AuthRepositoryImpl._isOurIssuer', Uri-нормализация Dart) прощает, а
+%%% бэкенд до фикса ломался ровно на нём: старт logout отдавал 401, а
+%%% backchannel-токен отвергался с `logout_token_bad_issuer', из-за чего
+%%% binding никогда не доходил до `op_revoked' и клиент получал вечный 409.
+%%%
+%%% Канонизация НЕ смеет сближать РАЗНЫЕ сущности: путь регистро-зависим
+%%% (realm `BRT' =/= `brt'), недефолтный порт значим, схема значима — поэтому
+%%% ниже к каждому «эквивалентному» написанию идёт «чужое» контрольное.
+%%%=============================================================================
+
+-define(KC_CANONICAL, <<"https://keycloak.brterminal.ru/realms/BRT">>).
+
+%% Написания, обозначающие ТОТ ЖЕ issuer, что и ?KC_CANONICAL.
+kc_issuer_equivalents() ->
+    [<<"https://keycloak.brterminal.ru/realms/BRT/">>          %% хвостовой слэш
+    ,<<"https://Keycloak.brterminal.ru/realms/BRT">>           %% регистр хоста
+    ,<<"https://Keycloak.brterminal.ru/realms/BRT/">>          %% регистр + слэш
+    ,<<"https://keycloak.brterminal.ru:443/realms/BRT">>       %% явный дефолтный порт
+    ,<<"HTTPS://keycloak.brterminal.ru/realms/BRT">>           %% регистр схемы
+    ,<<"https://keycloak.brterminal.ru/realms/BRT//">>         %% двойной хвостовой слэш
+    ].
+
+%% Написания ДРУГОГО issuer'а: гард `foreign_issuer' обязан их ловить и после
+%% канонизации.
+kc_issuer_foreigners() ->
+    [<<"https://keycloak.brterminal.ru/realms/OTHER">>         %% другой realm
+    ,<<"https://keycloak.brterminal.ru/realms/brt">>           %% путь регистро-ЗАВИСИМ
+    ,<<"https://foreign.example/realms/BRT">>                  %% другой хост
+    ,<<"https://keycloak.brterminal.ru:8443/realms/BRT">>      %% НЕдефолтный порт
+    ,<<"http://keycloak.brterminal.ru/realms/BRT">>            %% другая схема
+    ,<<"https://keycloak.brterminal.ru/realms/BRT/extra">>     %% лишний сегмент пути
+    ].
+
+logout_issuer_canonical_forms_test_() ->
+    Now = 2000000000,
+    IdClaims = #{<<"iss">> => ?KC_CANONICAL
+                ,<<"aud">> => ?LOGOUT_CLIENT
+                ,<<"sub">> => ?LOGOUT_SUB
+                ,<<"sid">> => ?LOGOUT_SID
+                ,<<"account_id">> => ?LOGOUT_ACCOUNT
+                },
+    EventClaims = #{<<"iss">> => ?KC_CANONICAL
+                   ,<<"aud">> => [?LOGOUT_CLIENT]
+                   ,<<"sid">> => ?LOGOUT_SID
+                   ,<<"jti">> => <<"logout-event-canon">>
+                   ,<<"iat">> => Now - 1
+                   ,<<"exp">> => Now + 60
+                   ,<<"events">> => #{?LOGOUT_EVENT => #{}}
+                   },
+    IdOk = {'ok', #{'sid' => ?LOGOUT_SID
+                   ,'sub' => ?LOGOUT_SUB
+                   ,'account_id' => ?LOGOUT_ACCOUNT}},
+    EventOk = {'ok', #{'sid' => ?LOGOUT_SID
+                      ,'jti' => <<"logout-event-canon">>
+                      ,'expires_at' => Now + 60}},
+    BadIssuer = {'error', 'logout_token_bad_issuer'},
+    %% позитивный контроль: канонический конфиг работал и до фикса — он не
+    %% должен перестать работать от канонизации.
+    Positive =
+        [{"канонический конфиг — старт logout",
+          ?_assertEqual(IdOk, zkeycloak_util:validate_logout_id_claims(
+                                IdClaims, ?KC_CANONICAL, ?LOGOUT_CLIENT))}
+        ,{"канонический конфиг — backchannel",
+          ?_assertEqual(EventOk, zkeycloak_util:validate_backchannel_claims(
+                                   EventClaims, ?KC_CANONICAL, ?LOGOUT_CLIENT, Now))}
+        ],
+    %% фальсификатор: на до-фиксовом коде каждая строка красная
+    %% (`logout_token_bad_issuer' вместо `ok').
+    Equivalent =
+        [[{"эквивалентный конфиг — старт logout: " ++ binary_to_list(Cfg),
+           ?_assertEqual(IdOk, zkeycloak_util:validate_logout_id_claims(
+                                 IdClaims, Cfg, ?LOGOUT_CLIENT))}
+         ,{"эквивалентный конфиг — backchannel: " ++ binary_to_list(Cfg),
+           ?_assertEqual(EventOk, zkeycloak_util:validate_backchannel_claims(
+                                    EventClaims, Cfg, ?LOGOUT_CLIENT, Now))}
+         ]
+         || Cfg <- kc_issuer_equivalents()
+        ],
+    %% негативный контроль: гард foreign issuer жив.
+    Foreign =
+        [[{"чужой issuer отвергнут — старт logout: " ++ binary_to_list(Cfg),
+           ?_assertEqual(BadIssuer, zkeycloak_util:validate_logout_id_claims(
+                                      IdClaims, Cfg, ?LOGOUT_CLIENT))}
+         ,{"чужой issuer отвергнут — backchannel: " ++ binary_to_list(Cfg),
+           ?_assertEqual(BadIssuer, zkeycloak_util:validate_backchannel_claims(
+                                      EventClaims, Cfg, ?LOGOUT_CLIENT, Now))}
+         ]
+         || Cfg <- kc_issuer_foreigners()
+        ],
+    %% отсутствующий `iss' — отказ, а не совпадение с `undefined'.
+    Missing =
+        [{"токен без iss отвергнут",
+          ?_assertEqual(BadIssuer, zkeycloak_util:validate_logout_id_claims(
+                                     maps:remove(<<"iss">>, IdClaims)
+                                    ,?KC_CANONICAL, ?LOGOUT_CLIENT))}
+        ],
+    lists:flatten([Positive, Equivalent, Foreign, Missing]).
+
 verify_backchannel_uses_unix_time_test_() ->
     {'setup',
      fun() ->
