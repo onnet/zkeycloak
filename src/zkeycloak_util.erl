@@ -155,6 +155,16 @@
                                ,<<"client_secret">>
                                ]).
 
+%% @doc Параметры URL (query и fragment), значения которых нельзя писать в
+%% лог сырыми: креды тела плюс то, что KC кладёт в адрес возврата.
+%%   `session_state' — id SSO-сессии KC в redirect на `auth_callback';
+%%   `state'         — CSRF-значение OIDC (implicit/hybrid — рядом с токенами).
+%% Замер 30.09: `referer' на `auth_callback' нёс `code=' целиком, 2/2 входа.
+-define(SENSITIVE_URL_PARAMS, [<<"session_state">>
+                              ,<<"state">>
+                               | ?SENSITIVE_BODY_KEYS
+                              ]).
+
 %% @doc Claim'ы KC (id_token / userinfo), значения которых МОЖНО писать в
 %% лог: служебные поля OIDC-флоу и гейтов этого модуля, к ПДн не относящиеся.
 %%
@@ -884,9 +894,10 @@ redact_pii(Value) ->
 %% см. `?SENSITIVE_HEADERS') несут живой Bearer-токен / Kazoo auth-token /
 %% session-cookie — сырой `~p'-дамп `cb_context:req_headers/1' в лог = утечка
 %% (issue 14 кросс-слойного KC-auth ревью; тот же класс, что issue 01 про
-%% токены). Маскируем ТОЛЬКО значения sensitive-заголовков через `redact/1'
-%% (SHA-256 fingerprint), имена и прочие заголовки оставляем как есть — лог
-%% сохраняет диагностическую ценность. `lager'-вызовы НЕ удаляем: правило
+%% токены). Значения sensitive-заголовков маскируются целиком через `redact/1'
+%% (SHA-256 fingerprint); в прочих маскируются только креды-параметры внутри
+%% URL (`redact_url_params/1', ?SENSITIVE_URL_PARAMS). Имена и остальное
+%% остаются — лог сохраняет диагностическую ценность. `lager'-вызовы НЕ удаляем: правило
 %% проекта — редактировать данные, не вырезать логи. Работает и с map
 %% (`cowboy:http_headers()' в этой версии Kazoo), и с proplist (историческая
 %% форма); неожиданную форму отдаём без изменений (fail-safe, лог не роняем).
@@ -903,7 +914,37 @@ redact_headers(Other) ->
 redact_header_kv(Key, Value) ->
     case is_sensitive_key(Key, ?SENSITIVE_HEADERS) of
         'true' -> redact(Value);
-        'false' -> Value
+        'false' -> redact_url_params(Value)
+    end.
+
+%% @doc Креды в URL несекретного заголовка (`referer' после редиректа KC,
+%% `location'). Имя заголовка не говорит, есть ли в значении адрес с `code=',
+%% поэтому проверяется любой: значение без `?'/`#' возвращается как есть.
+%% Маскируются только значения параметров из ?SENSITIVE_URL_PARAMS, тем же
+%% классом, что в теле (`redact_body_value/2'); адрес и прочие параметры
+%% остаются для диагностики.
+-spec redact_url_params(term()) -> term().
+redact_url_params(Value) when is_binary(Value) ->
+    case binary:match(Value, [<<"?">>, <<"#">>]) of
+        'nomatch' -> Value;
+        {Pos, 1} ->
+            Head = binary:part(Value, 0, Pos),
+            Tail = binary:part(Value, Pos, byte_size(Value) - Pos),
+            Parts = re:split(Tail, <<"([?#&])">>, [{'return', 'binary'}]),
+            iolist_to_binary([Head | [redact_url_param(Part) || Part <- Parts]])
+    end;
+redact_url_params(Value) ->
+    Value.
+
+-spec redact_url_param(binary()) -> binary().
+redact_url_param(Part) ->
+    case binary:split(Part, <<"=">>) of
+        [Name, ParamValue] ->
+            case is_sensitive_key(Name, ?SENSITIVE_URL_PARAMS) of
+                'true' -> <<Name/binary, "=", (redact_body_value(Name, ParamValue))/binary>>;
+                'false' -> Part
+            end;
+        _ -> Part
     end.
 
 %% @doc Санитизация ТЕЛА запроса перед логированием: маскируем ЗНАЧЕНИЯ

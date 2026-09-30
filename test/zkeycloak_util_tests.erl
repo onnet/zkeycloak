@@ -4,8 +4,9 @@
 %%% Покрыто (issue 14 KC-auth ревью + харднинг 16.07):
 %%%   * `redact/1' — маскирование одиночного секрета (undefined/пусто/binary);
 %%%   * `redact_headers/1' — маскирование ЗНАЧЕНИЙ credential-заголовков
-%%%     (`authorization'/`cookie'/`x-auth-token' …) с сохранением имён и
-%%%     не-sensitive значений; map- и proplist-формы; case-insensitive имена;
+%%%     (`authorization'/`cookie'/`x-auth-token' …) и креды-параметров в URL
+%%%     прочих заголовков (`referer' с `code='), с сохранением имён и
+%%%     остального; map- и proplist-формы; case-insensitive имена;
 %%%     fail-safe на неожиданной форме.
 %%%
 %%% Покрыто (issue 15 — тот же класс утечки через тело и claim'ы):
@@ -128,6 +129,75 @@ redact_headers_case_insensitive_name_test() ->
     {<<"Authorization">>, Masked} = lists:keyfind(<<"Authorization">>, 1, R),
     ?assertEqual('nomatch', binary:match(Masked, <<"UPPER-secret-xyz">>)),
     ?assertEqual({<<"Accept">>, <<"text/html">>}, lists:keyfind(<<"Accept">>, 1, R)).
+
+%%%=============================================================================
+%%% redact_headers/1 — креды в URL несекретного заголовка (referer после KC)
+%%%=============================================================================
+
+%% Форма `referer' на `auth_callback' 30.09: KC редиректит на наш адрес с
+%% `session_state', `iss' и `code' в query. Значения вымышленные.
+-define(KC_CODE, <<"1f2e3d4c-aaaa-bbbb-cccc-0123456789ab.5e6f7a8b-dddd-eeee-ffff-0123456789ab.9c0d1e2f-1111-2222-3333-0123456789ab">>).
+
+referer(Query) ->
+    <<"https://portal.example.ru/ext/login/", Query/binary>>.
+
+redacted_referer(Query) ->
+    maps:get(<<"referer">>, zkeycloak_util:redact_headers(#{<<"referer">> => referer(Query)})).
+
+referer_code_and_session_state_are_masked_test() ->
+    Out = redacted_referer(<<"?session_state=SeSsIoNsTaTe0123456789ab&iss=https%3A%2F%2Fkc.example.ru%2Frealms%2Fbrt&code=", ?KC_CODE/binary>>),
+    ?assertEqual('nomatch', binary:match(Out, ?KC_CODE)),
+    ?assertEqual('nomatch', binary:match(Out, <<"SeSsIoNsTaTe0123456789ab">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"&code=sha256:">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"?session_state=sha256:">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"&iss=https%3A%2F%2Fkc.example.ru%2Frealms%2Fbrt&">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"https://portal.example.ru/ext/login/?">>)).
+
+referer_fragment_tokens_are_masked_test() ->
+    %% implicit/hybrid-флоу кладёт токены во fragment.
+    Out = redacted_referer(<<"#access_token=eyJ.acc.sig&state=st4t3value&token_type=Bearer">>),
+    ?assertEqual('nomatch', binary:match(Out, <<"eyJ.acc.sig">>)),
+    ?assertEqual('nomatch', binary:match(Out, <<"st4t3value">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"&token_type=Bearer">>)).
+
+referer_value_with_equals_sign_is_masked_whole_test() ->
+    %% base64-`state' с паддингом: значение режется по ПЕРВОМУ `='.
+    Out = redacted_referer(<<"?state=c3RhdGUtdmFsdWU==&tab=1">>),
+    ?assertEqual('nomatch', binary:match(Out, <<"c3RhdGUtdmFsdWU">>)),
+    ?assertNotEqual('nomatch', binary:match(Out, <<"&tab=1">>)).
+
+referer_param_name_is_case_insensitive_test() ->
+    Out = redacted_referer(<<"?Code=", ?KC_CODE/binary>>),
+    ?assertEqual('nomatch', binary:match(Out, ?KC_CODE)).
+
+referer_password_gets_length_only_test() ->
+    %% Низкоэнтропийный класс тот же, что в теле: отпечаток пароля обратим.
+    Out = redacted_referer(<<"?password=hunter2">>),
+    ?assertEqual('nomatch', binary:match(Out, <<"hunter2">>)),
+    ?assertEqual('nomatch', binary:match(Out, <<"sha256:">>)).
+
+referer_code_challenge_is_kept_test() ->
+    %% Публичен по дизайну PKCE — см. ?SENSITIVE_BODY_KEYS.
+    Q = <<"?code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256">>,
+    ?assertEqual(referer(Q), redacted_referer(Q)).
+
+referer_without_sensitive_params_is_unchanged_test() ->
+    Q = <<"?tab=containers&page=2#top">>,
+    ?assertEqual(referer(Q), redacted_referer(Q)).
+
+header_without_query_is_unchanged_test() ->
+    Hs = #{<<"referer">> => <<"https://portal.example.ru/ext/login/">>
+          ,<<"user-agent">> => <<"Mozilla/5.0 (X11; Linux x86_64)">>
+          },
+    ?assertEqual(Hs, zkeycloak_util:redact_headers(Hs)).
+
+non_binary_plain_header_is_unchanged_test() ->
+    Hs = #{<<"referer">> => 'undefined'},
+    ?assertEqual(Hs, zkeycloak_util:redact_headers(Hs)).
+
+referer_in_proplist_form_is_masked_test() ->
+    [{<<"Referer">>, Out}] = zkeycloak_util:redact_headers([{<<"Referer">>, referer(<<"?code=", ?KC_CODE/binary>>)}]),
+    ?assertEqual('nomatch', binary:match(Out, ?KC_CODE)).
 
 redact_headers_undefined_value_no_crash_test() ->
     %% значение sensitive-заголовка = undefined → redact/1 не роняет.
