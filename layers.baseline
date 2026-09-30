@@ -1,0 +1,11 @@
+%% -*- mode: erlang; coding: utf-8 -*-
+%% Базлайн известных нарушений слоёв (AD-1/AD-2 спайна zthreads): исходящие рёбра zkeycloak.
+%% Генерирует `scripts/z-layers.escript sweep <AppsDir> --write` (kazoo_5027); руками
+%% правятся только `until' (условие возврата ребра) и записи {key, Site, Why}
+%% (атом или литерал — ключ сопоставления по AD-3, не ребро); свип их сохраняет.
+%% Правило слоёв — kazoo_5027/AGENTS.md, раздел «Слои приложений z*».
+{edge, zbrt,
+ #{kind => runtime,
+   until => <<"долг вне трека: привязка к общему exchange zbrt; условие возврата — свой exchange (kapi владельца) при следующей правке листенера"/utf8>>,
+   sites =>
+       [<<"literal zkeycloak_listener.erl -> 'zbrt'">>]}}.
