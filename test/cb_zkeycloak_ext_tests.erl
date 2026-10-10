@@ -182,7 +182,7 @@ valid_login_flow_test_() ->
 setup_boundaries() ->
     %% Границы (не наши модули) — мокаем, чтобы гейт-хвост не ходил в БД/auth.
     meck:new('kz_datamgr', ['no_link']),
-    meck:expect('kz_datamgr', 'open_doc', fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+    meck:expect('kz_datamgr', 'open_doc', fun(_Db, _Id) -> {'ok', user_doc()} end),
     meck:new('crossbar_auth', ['no_link']),
     meck:expect('crossbar_auth', 'create_auth_token',
                 fun(Ctx, _AuthModule) ->
@@ -205,8 +205,13 @@ cleanup_boundaries(_) ->
 %%% `kzd_users:enabled/1' — та же семантика, что у `cb_user_auth').
 %%%=============================================================================
 
--define(DISABLED_DOC, kz_json:from_list([{<<"enabled">>, 'false'}])).
--define(ENABLED_DOC, kz_json:from_list([{<<"enabled">>, 'true'}])).
+-define(DISABLED_DOC, kz_json:from_list([{<<"pvt_type">>, <<"user">>}
+                                        ,{<<"enabled">>, 'false'}])).
+-define(ENABLED_DOC, kz_json:from_list([{<<"pvt_type">>, <<"user">>}
+                                       ,{<<"enabled">>, 'true'}])).
+
+user_doc() ->
+    kz_json:from_list([{<<"pvt_type">>, <<"user">>}]).
 
 enabled_gate_test_() ->
     {'setup', fun setup_boundaries/0, fun cleanup_boundaries/1,
@@ -243,9 +248,22 @@ enabled_gate_test_() ->
              ,{"check_user_doc: поля enabled нет → ok (дефолт активный)",
                fun() ->
                        meck:expect('kz_datamgr', 'open_doc',
-                                   fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+                                   fun(_Db, _Id) -> {'ok', user_doc()} end),
                        ?assertEqual('ok', check_user_doc('login')),
                        ?assertEqual('ok', check_user_doc('refresh'))
+               end}
+             ,{"чужой тип документа не становится user при login/refresh",
+               fun() ->
+                       Foreign = kz_json:from_list([{<<"pvt_type">>, <<"account">>}]),
+                       meck:expect('kz_datamgr', 'open_doc',
+                                   fun(_Db, _Id) -> {'ok', Foreign} end),
+                       ?assertEqual({'error', 'user_doc_id_conflict'}, check_user_doc('login')),
+                       ?assertEqual({'error', 'user_doc_id_conflict'}, check_user_doc('refresh')),
+                       UserInfo = #{<<"sub">> => ?SUB_UUID
+                                   ,<<"account_id">> => ?ACCOUNT_ID},
+                       Ctx = cb_zkeycloak_ext:provide_keycloak_token(
+                               cb_context:new(), ?TA, ?TID, ?TR, UserInfo, 'login'),
+                       assert_401(Ctx)
                end}
              ,{"check_user_doc: enabled=false → тегированный user_disabled",
                fun() ->
@@ -267,6 +285,47 @@ enabled_gate_test_() ->
 check_user_doc(Mode) ->
     cb_zkeycloak_ext:check_user_doc(Mode, <<"account%2Ffe%2Fdc%2Fba">>,
                                     ?ACCOUNT_ID, ?OWNER_ID, #{}).
+
+jit_create_conflict_test_() ->
+    {'setup', fun setup_jit_conflict/0, fun cleanup_jit_conflict/1,
+     fun(_) ->
+             [{"конкурентный user сохраняется и допускается к enabled-гейту",
+               fun() -> assert_jit_conflict(user_doc(), 'ok', 3) end}
+             ,{"конкурентный account не превращается в user",
+               fun() ->
+                       Account = kz_json:from_list([{<<"pvt_type">>, <<"account">>}]),
+                       assert_jit_conflict(Account,
+                                           {'error', 'user_doc_id_conflict'}, 2)
+               end}
+             ]
+     end}.
+
+setup_jit_conflict() ->
+    setup_boundaries(),
+    meck:new('zkeycloak_util', ['no_link', 'passthrough']),
+    meck:expect('zkeycloak_util', 'create_user',
+                fun(_, _, _, _, _, _, _, _) -> {'error', 'conflict'} end),
+    'ok'.
+
+cleanup_jit_conflict(_) ->
+    _ = (catch meck:unload('zkeycloak_util')),
+    cleanup_boundaries('ok').
+
+assert_jit_conflict(Doc, Expected, Reads) ->
+    Counter = atomics:new(1, []),
+    CreateArgs = ['_', '_', '_', '_', '_', '_', '_', '_'],
+    Before = meck:num_calls('zkeycloak_util', 'create_user', CreateArgs),
+    meck:expect('kz_datamgr', 'open_doc',
+                fun(_Db, _Id) ->
+                        case atomics:add_get(Counter, 1, 1) of
+                            1 -> {'error', 'not_found'};
+                            _ -> {'ok', Doc}
+                        end
+                end),
+    ?assertEqual(Expected, check_user_doc('login')),
+    ?assertEqual(Reads, atomics:get(Counter, 1)),
+    ?assertEqual(Before + 1,
+                 meck:num_calls('zkeycloak_util', 'create_user', CreateArgs)).
 
 %%%=============================================================================
 %%% logout `id_token_hint' — только POST-тело (issue 02 волна 2)

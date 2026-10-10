@@ -1403,12 +1403,11 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
         {'true', UDoc1} ->
             UDoc2 = crossbar_doc:update_pvt_parameters(UDoc1, Ctx1),
             UDoc3 = kz_json:set_value(<<"pvt_type">>,<<"user">>,UDoc2),
-            Creates = kz_json:to_proplist(UDoc3),
-            UpdateOptions = [{'create', Creates}
-                            ,{'update', Creates}
-                            ,{'ensure_saved', 'true'}
-                            ],
-            Result = kz_datamgr:update_doc(DbName, UserDocId, UpdateOptions),
+            %% JIT creation must not replace a document created after the
+            %% caller's not_found read. In particular, an upsert here could
+            %% reset a concurrent admin grant to the default user.
+            Result = kz_datamgr:save_doc(DbName,
+                       kz_doc:delete_revision(kz_doc:set_id(UDoc3, UserDocId))),
             %% issue 15: на успехе `Result' = `{ok, <сохранённый user-doc>}', а
             %% он несёт и ПДн (`first_name'/`last_name'/`email'/`username' из
             %% claim'ов), и pvt-хеши пароля — сырой `~p' = та же утечка, что
@@ -1790,11 +1789,19 @@ account_id_claim(Claims) ->
 user_enabled_gate(DbName, OwnerId) ->
     case kz_datamgr:open_cache_doc(DbName, OwnerId) of
         {'ok', UserDoc} ->
-            case kzd_users:enabled(UserDoc) of
-                'true' -> {'ok', 'onbill_access_provided'};
+            case kz_doc:type(UserDoc) =:= kzd_users:type() of
                 'false' ->
-                    lager:warning("kc token validation: subject ~s is disabled, rejecting", [OwnerId]),
-                    {'error', 'user_disabled'}
+                    lager:warning("kc token validation: subject ~s is not a user-doc, rejecting",
+                                  [OwnerId]),
+                    {'error', 'kc_user_doc_not_user'};
+                'true' ->
+                    case kzd_users:enabled(UserDoc) of
+                        'true' -> {'ok', 'onbill_access_provided'};
+                        'false' ->
+                            lager:warning("kc token validation: subject ~s is disabled, rejecting",
+                                          [OwnerId]),
+                            {'error', 'user_disabled'}
+                    end
             end;
         {'error', 'not_found'} ->
             %% сырой KC-токен юзера, которого не провижнили через
@@ -1936,4 +1943,3 @@ logout_url(IdTokenHint, State) ->
              end,
     QS = uri_string:compose_query(Params),
     <<EndSession/binary, "?", QS/binary>>.
-

@@ -114,7 +114,11 @@ setup() ->
                 fun(_State, _Verifier) ->
                         {'ok', kz_json:from_list([{<<"state">>, <<"consumed">>}])}
                 end),
-    meck:expect('kz_datamgr', 'open_doc', fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+    %% ensure_user_doc/5 now accepts only an existing doc of type user.
+    meck:expect('kz_datamgr', 'open_doc'
+               ,fun(_Db, Id) -> {'ok', kz_json:from_list([{<<"_id">>, Id}
+                                                         ,{<<"pvt_type">>, <<"user">>}])}
+                end),
     meck:expect('crossbar_auth', 'create_auth_token'
                ,fun(Ctx, _Mod) ->
                         cb_context:set_resp_status(

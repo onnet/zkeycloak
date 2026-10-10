@@ -1136,11 +1136,16 @@ check_user_enabled(DbName, OwnerId) ->
 %% (дефолт `true': док без поля = активный, каноническая семантика Kazoo,
 %% та же, что в `cb_user_auth'). NB: `kzd_users:is_enabled/1' в кодбейзе
 %% не существует — issue-01 ссылался на него по памяти.
--spec user_enabled_gate(kz_json:object()) -> 'ok' | {'error', 'user_disabled'}.
+-spec user_enabled_gate(kz_json:object()) ->
+          'ok' | {'error', 'user_disabled' | 'user_doc_id_conflict'}.
 user_enabled_gate(UserDoc) ->
-    case kzd_users:enabled(UserDoc) of
-        'true' -> 'ok';
-        'false' -> {'error', 'user_disabled'}
+    case kz_doc:type(UserDoc) =:= kzd_users:type() of
+        'false' -> {'error', 'user_doc_id_conflict'};
+        'true' ->
+            case kzd_users:enabled(UserDoc) of
+                'true' -> 'ok';
+                'false' -> {'error', 'user_disabled'}
+            end
     end.
 
 %% @doc Гарантировать, что у `OwnerId' есть user-doc в account-db. Если
@@ -1155,7 +1160,7 @@ user_enabled_gate(UserDoc) ->
                      ) -> 'ok' | {'error', term()}.
 ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap, AuthSource) ->
     case kz_datamgr:open_doc(DbName, OwnerId) of
-        {'ok', _} -> 'ok';
+        {'ok', UserDoc} -> user_enabled_gate(UserDoc);
         {'error', 'not_found'} ->
             Firstname = kz_maps:get(<<"given_name">>, UserInfoMap, 'undefined'),
             Surname = kz_maps:get(<<"family_name">>, UserInfoMap, 'undefined'),
@@ -1168,6 +1173,13 @@ ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap, AuthSource) ->
                                             Email, 'undefined', UserPassword,
                                             kz_term:to_binary(AuthSource)) of
                 {'ok', _} -> 'ok';
+                {'error', 'conflict'} ->
+                    %% Another writer won the create race. Re-read its doc;
+                    %% only an actual user may complete authentication.
+                    case kz_datamgr:open_doc(DbName, OwnerId) of
+                        {'ok', ConcurrentDoc} -> user_enabled_gate(ConcurrentDoc);
+                        {'error', _} -> {'error', 'datastore_unreachable'}
+                    end;
                 {'error', _} = Err -> Err
             end;
         {'error', _} = OpenErr ->
@@ -1205,6 +1217,8 @@ ensure_user_doc(DbName, AccountId, OwnerId, UserInfoMap, AuthSource) ->
 reject_user_provisioning(Context, 'refresh', _Reason) ->
     cb_context:add_system_error('invalid_credentials', Context);
 reject_user_provisioning(Context, 'login', 'user_disabled') ->
+    cb_context:add_system_error('invalid_credentials', Context);
+reject_user_provisioning(Context, 'login', 'user_doc_id_conflict') ->
     cb_context:add_system_error('invalid_credentials', Context);
 reject_user_provisioning(Context, 'login', {'validation_errors', Errors}) ->
     cb_context:add_doc_validation_errors(Context, Errors);
@@ -1375,4 +1389,3 @@ build_full_name(UserInfoJObj) ->
         {G, 'undefined'} -> G;
         {G, F} -> <<G/binary, " ", F/binary>>
     end.
-

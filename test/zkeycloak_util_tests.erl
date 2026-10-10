@@ -881,8 +881,10 @@ is_provider_unavailable_false_for_credential_errors_test() ->
 -define(GATE_CLAIMS, [{<<"sub">>, ?GATE_SUB}
                      ,{<<"account_id">>, ?GATE_ACCOUNT_ID}
                      ]).
--define(GATE_ENABLED_DOC, kz_json:from_list([{<<"enabled">>, 'true'}])).
--define(GATE_DISABLED_DOC, kz_json:from_list([{<<"enabled">>, 'false'}])).
+-define(GATE_ENABLED_DOC, kz_json:from_list([{<<"pvt_type">>, <<"user">>}
+                                            ,{<<"enabled">>, 'true'}])).
+-define(GATE_DISABLED_DOC, kz_json:from_list([{<<"pvt_type">>, <<"user">>}
+                                             ,{<<"enabled">>, 'false'}])).
 
 subject_enabled_gate_test_() ->
     {'setup', fun gate_setup/0, fun gate_cleanup/1,
@@ -902,8 +904,19 @@ subject_enabled_gate_test_() ->
              ,{"поля enabled нет → активный (дефолт kzd_users:enabled/1, как G-1)",
                fun() ->
                        meck:expect('kz_datamgr', 'open_cache_doc',
-                                   fun(_Db, _Id) -> {'ok', kz_json:new()} end),
+                                   fun(_Db, _Id) ->
+                                           {'ok', kz_json:from_list(
+                                                    [{<<"pvt_type">>, <<"user">>}])}
+                                   end),
                        ?assertEqual({'ok', 'onbill_access_provided'},
+                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+               end}
+             ,{"чужой тип документа не подтверждает сырой KC-токен",
+               fun() ->
+                       Account = kz_json:from_list([{<<"pvt_type">>, <<"account">>}]),
+                       meck:expect('kz_datamgr', 'open_cache_doc',
+                                   fun(_Db, _Id) -> {'ok', Account} end),
+                       ?assertEqual({'error', 'kc_user_doc_not_user'},
                                     zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
                end}
              ,{"enabled=false → user_disabled: живой KC-токен деактивированного"
@@ -1197,6 +1210,41 @@ create_user_setup() ->
 create_user_cleanup(_) ->
     _ = (catch meck:unload('kzd_users')),
     'ok'.
+
+create_user_is_create_only_test_() ->
+    {'setup', fun create_only_setup/0, fun create_only_cleanup/1,
+     fun(_) ->
+             [fun() ->
+             Result = create_user([<<"ldap">>]),
+             ?assertEqual({'error', 'conflict'}, Result),
+             ?assertEqual(1, meck:num_calls('kz_datamgr', 'save_doc', ['_', '_'])),
+             ?assertEqual(0, meck:num_calls('kz_datamgr', 'update_doc',
+                                           ['_', '_', '_'])),
+             [{_Pid, {'kz_datamgr', 'save_doc', [_Db, Saved]}, _Result}] =
+                 [Call || Call = {_Pid, {'kz_datamgr', 'save_doc', _}, _Result}
+                              <- meck:history('kz_datamgr')],
+             ?assertEqual(?CU_OWNER_ID, kz_doc:id(Saved)),
+             ?assertEqual('undefined', kz_doc:revision(Saved)),
+             ?assertEqual(<<"user">>, kz_doc:type(Saved))
+              end]
+     end}.
+
+create_only_setup() ->
+    meck:new('kzd_users', ['no_link', 'passthrough']),
+    meck:expect('kzd_users', 'validate',
+                fun(_A, _I, UDoc) -> {'true', UDoc} end),
+    meck:new('crossbar_doc', ['no_link', 'passthrough']),
+    meck:expect('crossbar_doc', 'update_pvt_parameters',
+                fun(Doc, _Ctx) -> Doc end),
+    meck:new('kz_datamgr', ['no_link']),
+    meck:expect('kz_datamgr', 'save_doc',
+                fun(_Db, _Doc) -> {'error', 'conflict'} end),
+    'ok'.
+
+create_only_cleanup(_) ->
+    _ = (catch meck:unload('kz_datamgr')),
+    _ = (catch meck:unload('crossbar_doc')),
+    create_user_cleanup('ok').
 %%%=============================================================================
 %%% OIDC logout claim validation. Signature verification is covered by the
 %%% production wrappers; this pure seam pins identity and event constraints.
