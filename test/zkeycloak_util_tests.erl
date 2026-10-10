@@ -934,13 +934,11 @@ subject_enabled_gate_test_() ->
                        ?assertEqual({'error', 'kc_user_doc_missing'},
                                     zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
                end}
-             ,{"datastore-сбой → datastore_unreachable, НЕ пропуск (fail-closed;"
-               " транспортно это тоже 401 — cb_token_auth схлопывает error в decline)",
+             ,{"datastore-сбой → auth_store_unavailable, НЕ пропуск и НЕ вердикт"
+               " (fail-closed; cb_token_auth отвечает 503, сессия клиента жива)",
                fun() ->
-                       meck:expect('kz_datamgr', 'open_cache_doc',
-                                   fun(_Db, _Id) -> {'error', 'timeout'} end),
-                       ?assertEqual({'error', 'datastore_unreachable'},
-                                    zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS))
+                       lists:foreach(fun assert_gate_store_error_unavailable/1,
+                                     ['timeout', 'db_not_reachable'])
                end}
              ,{"sub не KIS-derived uuid → kc_subject_not_kis, до datastore не доходим",
                fun() ->
@@ -1019,6 +1017,11 @@ subject_enabled_gate_test_() ->
                end}
              ]
      end}.
+
+assert_gate_store_error_unavailable(Reason) ->
+    meck:expect('kz_datamgr', 'open_cache_doc', fun(_Db, _Id) -> {'error', Reason} end),
+    ?assertEqual({'error', 'auth_store_unavailable'},
+                 zkeycloak_util:validate_subject_enabled(?GATE_CLAIMS)).
 
 gate_setup() ->
     meck:new('kz_datamgr', ['no_link']),

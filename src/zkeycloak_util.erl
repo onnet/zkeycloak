@@ -1730,10 +1730,12 @@ validate_onbill_access(Token) ->
 %% Семантика — симметрично G-1 на выдаче (`cb_zkeycloak_ext:
 %% user_enabled_gate/1'): док без поля `enabled' = активный. Fail-closed
 %% целиком: нерезолвящийся `sub', малформный `account_id'-claim,
-%% отсутствующий док, datastore-сбой — отказ. Транспортного различения
-%% 401/503 на пути валидации НЕТ — `cb_token_auth' схлопывает любой
-%% `{error,_}' в decline (центральный 401 от `api_util:is_authentic');
-%% различение остаётся в атомах причин и warning-логах для оператора.
+%% отсутствующий док, datastore-сбой — отказ. Datastore-сбой при этом НЕ
+%% вердикт о субъекте: он отдаётся как `auth_store_unavailable', и
+%% `cb_token_auth' отвечает 503 (сессия клиента жива, клиент повторяет), а
+%% не 401, на котором zfront/zfield разлогинивают (решение владельца
+%% 10.10.2026, то же правило, что в `kz_auth_gate'). Прочие отказы —
+%% decline и центральный 401 от `api_util:is_authentic'.
 %%
 %% Чтение через `open_cache_doc' — путь горячий (каждый запрос с
 %% KC-токеном, в отличие от редкого refresh G-1); деактивация инвалидирует
@@ -1814,7 +1816,7 @@ user_enabled_gate(DbName, OwnerId) ->
             lager:warning("kc token validation: datastore error reading ~s/~s: ~p,"
                           " rejecting (fail-closed)",
                           [DbName, OwnerId, OpenErr]),
-            {'error', 'datastore_unreachable'}
+            {'error', 'auth_store_unavailable'}
     end.
 
 %% @doc raw-account-id — ровно 32 hex-байта: единственная форма, которую
