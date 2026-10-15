@@ -1632,13 +1632,37 @@ refresh_expires_at(Token, Fallback) ->
                  end,
         Claims = kz_json:decode(
                    base64:decode(Padded, #{'mode' => 'urlsafe'})),
-        Exp = kz_json:get_integer_value(<<"exp">>, Claims, FallbackExpiry),
+        Exp = refresh_claims_expiry(Claims, FallbackExpiry),
         case erlang:max(Exp, FallbackExpiry) of
             0 -> Fallback;
             RetainUntil -> RetainUntil
         end
     catch
         _:_ -> Fallback
+    end.
+
+-spec refresh_claims_expiry(kz_json:object(), integer()) -> integer().
+refresh_claims_expiry(Claims, Fallback) ->
+    case {kz_json:get_ne_binary_value(<<"typ">>, Claims),
+          kz_json:get_value(<<"exp">>, Claims)} of
+        {<<"Offline">>, Exp} when Exp =:= 'undefined'; Exp =:= 0 ->
+            kz_time:current_unix_tstamp() + offline_refresh_retention();
+        {_, Exp} when is_integer(Exp), Exp > 0 -> Exp;
+        _ -> Fallback
+    end.
+
+%% Offline credentials without exp follow the provider's idle policy, not
+%% the five-minute ID token. Keep the binding through that idle window;
+%% Keycloak still validates every exchange and revocation remains authoritative.
+-spec offline_refresh_retention() -> pos_integer().
+offline_refresh_retention() ->
+    Default = 30 * 86400,
+    try kapps_config:get_integer(<<"zkeycloak">>,
+                                <<"offline_refresh_retention_s">>, Default) of
+        Ttl when is_integer(Ttl), Ttl > 0 -> Ttl;
+        _ -> Default
+    catch
+        _:_ -> Default
     end.
 
 
