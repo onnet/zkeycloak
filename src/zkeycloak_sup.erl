@@ -16,7 +16,6 @@
 
 %% Helper macro for declaring children of supervisor
 -define(CHILDREN, [?CACHE(?CACHE_NAME)
-                  ,?WORKER('zkeycloak_listener')
                   ,?SUPER('zkeycloak_oidcc_sup')
                   ]).
 

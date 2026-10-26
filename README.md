@@ -39,10 +39,8 @@ src/
   zkeycloak.app.src            -- OTP application descriptor (vsn 4.0.0, dep oidcc)
   zkeycloak.hrl                -- макросы (?APP_NAME, ?CACHE_NAME)
   zkeycloak_app.erl            -- application callback (declare_exchanges + sup)
-  zkeycloak_sup.erl            -- supervisor: cache + listener + oidcc-sup
+  zkeycloak_sup.erl            -- supervisor: cache + oidcc-sup
   zkeycloak_oidcc_sup.erl      -- supervisor над oidcc_provider_configuration_worker
-  zkeycloak_listener.erl       -- gen_listener (биндинги zbrt/self, RESPONDER tosdb)
-  zkeycloak_handlers.erl       -- AMQP-хендлер tosdb_req/2
   kapi_zkeycloak.erl           -- kapi: resp/publish_resp (targeted)
   zkeycloak_util.erl           -- ядро OIDC: auth_url / retrieve_token / userinfo /
                                   refresh_token / create_user / logout_url / auth_method /
@@ -52,8 +50,7 @@ src/
 ```
 
 При старте `zkeycloak_app:start/2` объявляет AMQP-обмены (`kapi_self`) и
-поднимает `zkeycloak_sup`: ETS-кэш `zkeycloak_cache`, `zkeycloak_listener`
-(gen_listener) и `zkeycloak_oidcc_sup`, который держит
+поднимает `zkeycloak_sup`: ETS-кэш `zkeycloak_cache` и `zkeycloak_oidcc_sup`, который держит
 `oidcc_provider_configuration_worker` — он подтягивает метаданные KC по
 `issuer` и регистрирует клиента под именем `client_id_atom()`.
 
@@ -145,9 +142,10 @@ confirmation page. Hint фронт берёт из `kc_id_token`, получен
 
 ## AMQP
 
-`zkeycloak_listener` — `gen_listener` с биндингами `zbrt`/`self` и
-RESPONDER'ом на событие `zkeycloak.tosdb` (`zkeycloak_handlers:tosdb_req/2`).
-`kapi_zkeycloak` публикует targeted-ответы (`publish_resp/2,3`).
+Слушателя AMQP у приложения нет: заготовка `zkeycloak_listener`/`zkeycloak_handlers`
+(копия zodbc, привязка к exchange `zbrt`, responder только логировал, публикатора
+категории `zkeycloak` в дереве не было) снята 26.10 — она роняла поставку standalone,
+где zbrt не едет. `kapi_zkeycloak` публикует targeted-ответы (`publish_resp/2,3`).
 
 ## Замечание о Keycloak SPI (Java)
 
