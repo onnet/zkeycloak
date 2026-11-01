@@ -52,6 +52,8 @@ execute_contract_test_() ->
     ,[fun validate_refresh_stores_token_without_calling_kc_/1
      ,fun validate_refresh_loads_authoritative_binding_/1
      ,fun validate_refresh_unbound_rejected_before_kc_/1
+     ,fun validate_refresh_revoked_rejected_before_kc_/1
+     ,fun validate_refresh_store_failure_is_retryable_/1
      ,fun validate_refresh_without_token_is_401_before_kc_/1
      ,fun execute_refresh_exchanges_and_issues_token_/1
      ,fun execute_refresh_rotates_binding_before_issuance_/1
@@ -161,6 +163,34 @@ validate_refresh_unbound_rejected_before_kc_(_) ->
     Result = cb_zkeycloak_ext:validate(refresh_ctx(?OLD_REFRESH), ?REFRESH),
     [?_assertEqual('error', cb_context:resp_status(Result))
     ,?_assertEqual(401, cb_context:resp_error_code(Result))
+    ,?_assertEqual(0, meck:num_calls('zkeycloak_util', 'refresh_token', '_'))
+    ,?_assertEqual(0, meck:num_calls('crossbar_auth', 'create_auth_token', '_'))
+    ].
+
+validate_refresh_revoked_rejected_before_kc_(_) ->
+    Claims = kz_json:from_list([{<<"account_id">>, ?ACCOUNT_ID},
+                               {<<"owner_id">>, ?OWNER_ID}]),
+    [begin
+         meck:expect('kz_auth_session_family', 'lookup_refresh',
+                     fun(_Token) -> {'error', Reason} end),
+         Result = cb_zkeycloak_ext:validate(refresh_ctx(?OLD_REFRESH), ?REFRESH),
+         [?_assertEqual('error', cb_context:resp_status(Result))
+         ,?_assertEqual(401, cb_context:resp_error_code(Result))
+         ,?_assertEqual('undefined', cb_context:fetch(Result, ?HANDOVER_KEY))
+         ,?_assertEqual('undefined', kz_json:get_value(<<"account_id">>, cb_context:resp_data(Result)))
+         ,?_assertEqual('undefined', kz_json:get_value(<<"owner_id">>, cb_context:resp_data(Result)))
+         ,?_assertEqual(0, meck:num_calls('zkeycloak_util', 'refresh_token', '_'))
+         ,?_assertEqual(0, meck:num_calls('crossbar_auth', 'create_auth_token', '_'))
+         ]
+     end || Reason <- ['session_revoked', {'session_revoked', Claims}]].
+
+validate_refresh_store_failure_is_retryable_(_) ->
+    meck:expect('kz_auth_session_family', 'lookup_refresh',
+                fun(_Token) -> {'error', 'auth_store_unavailable'} end),
+    Result = cb_zkeycloak_ext:validate(refresh_ctx(?OLD_REFRESH), ?REFRESH),
+    [?_assertEqual('error', cb_context:resp_status(Result))
+    ,?_assertEqual(503, cb_context:resp_error_code(Result))
+    ,?_assertEqual('undefined', cb_context:fetch(Result, ?HANDOVER_KEY))
     ,?_assertEqual(0, meck:num_calls('zkeycloak_util', 'refresh_token', '_'))
     ,?_assertEqual(0, meck:num_calls('crossbar_auth', 'create_auth_token', '_'))
     ].

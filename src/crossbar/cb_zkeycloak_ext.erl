@@ -796,6 +796,8 @@ validate_refresh_binding(Context, RefreshToken) ->
             end;
         {'error', 'session_revoked'} ->
             cb_context:add_system_error('invalid_credentials', Context);
+        {'error', {'session_revoked', _Claims}} ->
+            cb_context:add_system_error('invalid_credentials', Context);
         {'error', 'invalid_session_binding'} ->
             cb_context:add_system_error('invalid_credentials', Context);
         {'error', Reason} ->
