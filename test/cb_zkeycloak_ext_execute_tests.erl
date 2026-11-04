@@ -66,6 +66,9 @@ execute_contract_test_() ->
      ,fun request_data_rejects_non_form_backchannel_/1
      ,fun execute_logout_ack_requires_receipt_/1
      ,fun execute_logout_ack_unconfirmed_is_409_/1
+     ,fun execute_logout_ack_provider_closes_verified_target_/1
+     ,fun execute_logout_ack_provider_failure_stays_pending_/1
+     ,fun execute_logout_ack_invalid_verifier_never_calls_provider_/1
      ,fun execute_refresh_invalid_grant_maps_to_401_/1
      ,fun execute_logout_keeps_url_envelope_/1
      ,fun logout_start_is_rate_limited_/1
@@ -116,6 +119,10 @@ setup() ->
                 fun(_State, _Verifier) ->
                         {'ok', kz_json:from_list([{<<"state">>, <<"consumed">>}])}
                 end),
+    meck:expect('kz_auth_session_family', 'logout_target',
+                fun(_, _) -> {'error', 'keycloak_logout_unconfirmed'} end),
+    meck:expect('zkeycloak_util', 'close_logout_session',
+                fun(_, _) -> {'error', 'keycloak_logout_unconfirmed'} end),
     %% ensure_user_doc/5 now accepts only an existing doc of type user.
     meck:expect('kz_datamgr', 'open_doc'
                ,fun(_Db, Id) -> {'ok', kz_json:from_list([{<<"_id">>, Id}
@@ -562,3 +569,35 @@ userinfo() ->
      ,<<"family_name">> => <<"Петров"/utf8>>
      ,<<"resource_access">> => #{<<"onbill_client">> => #{<<"roles">> => [<<"onbill_access">>]}}
      }.
+
+execute_logout_ack_provider_closes_verified_target_(_) ->
+    meck:expect('kz_auth_session_family', 'ack_logout', 2,
+                meck:seq([{'error', 'keycloak_logout_unconfirmed'}, {'ok', kz_json:new()}])),
+    meck:expect('kz_auth_session_family', 'logout_target',
+                fun(_, _) -> {'ok', #{'sid' => ?SID, 'owner_id' => ?OWNER_ID}} end),
+    meck:expect('zkeycloak_util', 'close_logout_session',
+                fun(?SID, ?SUB_UUID) -> 'ok' end),
+    Validated = cb_zkeycloak_ext:validate(ack_ctx(), ?LOGOUT, ?ACK),
+    Result = cb_zkeycloak_ext:post(preset_fatal(Validated), ?LOGOUT, ?ACK),
+    [?_assertEqual('success', cb_context:resp_status(Result)),
+     ?_assertEqual(1, meck:num_calls('zkeycloak_util', 'close_logout_session', [?SID, ?SUB_UUID])),
+     ?_assertEqual(1, meck:num_calls('kz_auth_session_family', 'revoke_kc_sid', '_'))].
+
+execute_logout_ack_provider_failure_stays_pending_(_) ->
+    meck:expect('kz_auth_session_family', 'ack_logout',
+                fun(_, _) -> {'error', 'keycloak_logout_unconfirmed'} end),
+    meck:expect('kz_auth_session_family', 'logout_target',
+                fun(_, _) -> {'ok', #{'sid' => ?SID, 'owner_id' => ?OWNER_ID}} end),
+    Validated = cb_zkeycloak_ext:validate(ack_ctx(), ?LOGOUT, ?ACK),
+    Result = cb_zkeycloak_ext:post(preset_fatal(Validated), ?LOGOUT, ?ACK),
+    [?_assertEqual(409, cb_context:resp_error_code(Result)),
+     ?_assertEqual(0, meck:num_calls('kz_auth_session_family', 'revoke_kc_sid', '_'))].
+
+execute_logout_ack_invalid_verifier_never_calls_provider_(_) ->
+    meck:expect('kz_auth_session_family', 'ack_logout',
+                fun(_, _) -> {'error', 'invalid_logout_verifier'} end),
+    Validated = cb_zkeycloak_ext:validate(ack_ctx(), ?LOGOUT, ?ACK),
+    Result = cb_zkeycloak_ext:post(preset_fatal(Validated), ?LOGOUT, ?ACK),
+    [?_assertEqual(401, cb_context:resp_error_code(Result)),
+     ?_assertEqual(0, meck:num_calls('kz_auth_session_family', 'logout_target', '_')),
+     ?_assertEqual(0, meck:num_calls('zkeycloak_util', 'close_logout_session', '_'))].

@@ -34,6 +34,7 @@
         ,logout_url/0
         ,logout_url/1
         ,logout_url/2
+        ,close_logout_session/2
         ,verify_logout_id_token/1
         ,verify_backchannel_logout_token/1
         ,validate_logout_id_claims/3
@@ -1430,6 +1431,48 @@ create_user(AccountId, UserDocId, Firstname, Surname, Email, Phonenumber, UserPa
             %% т.е. весь `UDoc' (ФИО, email, пароль). Логируем M:F/A без args.
             lager:error("create_user crashed: ~p", [redact_crash(Crash)]),
             {'error', Crash}
+    end.
+
+%% @doc Authoritatively close the exact provider session over authenticated HTTPS.
+-spec close_logout_session(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          'ok' | {'error', 'keycloak_logout_unconfirmed'}.
+close_logout_session(Sid, Sub) ->
+    try
+        Issuer = issuer(),
+        #{scheme := <<"https">>, host := Host} = uri_string:parse(Issuer),
+        ClientId = client_id(),
+        Body = kz_http_util:props_to_querystring(
+                 [{<<"client_id">>, ClientId}, {<<"client_secret">>, client_secret()},
+                  {<<"sid">>, Sid}, {<<"sub">>, Sub}]),
+        Timeout = maps:get('timeout', kc_request_opts()),
+        Options = [{'timeout', Timeout}, {'connect_timeout', Timeout},
+                   {'autoredirect', 'false'},
+                   {'ssl', [{'verify', 'verify_peer'},
+                            {'cacerts', public_key:cacerts_get()},
+                            {'server_name_indication', binary_to_list(Host)},
+                            {'customize_hostname_check',
+                             [{'match_fun', public_key:pkix_verify_hostname_match_fun('https')}]}]}],
+        Url = <<Issuer/binary, "/brt-session/logout">>,
+        case kz_http:post(Url, [{"content-type", "application/x-www-form-urlencoded"}],
+                          Body, Options) of
+            {'ok', 200, _Headers, Response} ->
+                validate_closed_logout_response(kz_json:decode(Response), Sid, Sub, ClientId);
+            _ -> {'error', 'keycloak_logout_unconfirmed'}
+        end
+    catch
+        _:_ -> {'error', 'keycloak_logout_unconfirmed'}
+    end.
+
+-spec validate_closed_logout_response(kz_json:object(), kz_term:ne_binary(),
+                                      kz_term:ne_binary(), kz_term:ne_binary()) ->
+          'ok' | {'error', 'keycloak_logout_unconfirmed'}.
+validate_closed_logout_response(Response, Sid, Sub, ClientId) ->
+    case {kz_json:get_value(<<"status">>, Response),
+          kz_json:get_value(<<"sid">>, Response),
+          kz_json:get_value(<<"sub">>, Response),
+          kz_json:get_value(<<"client_id">>, Response)} of
+        {<<"closed">>, Sid, Sub, ClientId} -> 'ok';
+        _ -> {'error', 'keycloak_logout_unconfirmed'}
     end.
 
 %% @doc Verify an RP-initiated logout ID token without requiring it to be

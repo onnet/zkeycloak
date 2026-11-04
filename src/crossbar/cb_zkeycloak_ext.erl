@@ -598,7 +598,7 @@ execute_backchannel(Context, _NoHandover) -> Context.
 
 -spec execute_logout_ack(cb_context:context(), any()) -> cb_context:context().
 execute_logout_ack(Context, {'ack', State, Verifier}) ->
-    case kz_auth_session_family:ack_logout(State, Verifier) of
+    case ack_logout_with_provider(State, Verifier) of
         {'ok', _Transaction} ->
             Resp = kz_json:from_list([{<<"kazoo_status">>, <<"revoked">>}
                                      ,{<<"keycloak_status">>, <<"confirmed">>}]),
@@ -607,6 +607,34 @@ execute_logout_ack(Context, {'ack', State, Verifier}) ->
         {'error', Reason} -> logout_backend_error(Context, Reason)
     end;
 execute_logout_ack(Context, _NoHandover) -> Context.
+
+-spec ack_logout_with_provider(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          {'ok', kz_json:object()} | {'error', any()}.
+ack_logout_with_provider(State, Verifier) ->
+    case kz_auth_session_family:ack_logout(State, Verifier) of
+        {'error', 'keycloak_logout_unconfirmed'} ->
+            close_pending_logout(State, Verifier);
+        Result -> Result
+    end.
+
+-spec close_pending_logout(kz_term:ne_binary(), kz_term:ne_binary()) ->
+          {'ok', kz_json:object()} | {'error', any()}.
+close_pending_logout(State, Verifier) ->
+    case kz_auth_session_family:logout_target(State, Verifier) of
+        {'ok', #{'sid' := Sid, 'owner_id' := OwnerId}} ->
+            Sub = zcore_util:to_key(OwnerId),
+            case zkeycloak_util:close_logout_session(Sid, Sub) of
+                'ok' ->
+                    Jti = <<"server-logout:", State/binary>>,
+                    Expiry = kz_time:current_unix_tstamp() + 300,
+                    case kz_auth_session_family:revoke_kc_sid(Sid, Jti, Expiry) of
+                        {'ok', _} -> kz_auth_session_family:ack_logout(State, Verifier);
+                        {'error', _}=Error -> Error
+                    end;
+                {'error', _}=Error -> Error
+            end;
+        {'error', _}=Error -> Error
+    end.
 
 -spec logout_backend_error(cb_context:context(), any()) -> cb_context:context().
 logout_backend_error(Context, Reason) ->
